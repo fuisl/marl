@@ -129,7 +129,7 @@ class TraCIAdapter:
         return list(self._require_conn().trafficlight.getControlledLanes(tl_id))
 
     def get_controlled_links(self, tl_id: str) -> list[list[tuple[str, str, str]]]:
-        return self._require_conn().trafficlight.getControlledLinks(tl_id)
+        return list(self._require_conn().trafficlight.getControlledLinks(tl_id))
 
     def get_red_yellow_green_state(self, tl_id: str) -> str:
         return self._require_conn().trafficlight.getRedYellowGreenState(tl_id)
