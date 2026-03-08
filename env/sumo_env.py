@@ -194,9 +194,7 @@ class TrafficSignalEnv:
         # Done
         done = self.adapter.min_expected_vehicles == 0
         td["done"] = torch.tensor([done], dtype=torch.bool)
-        td["agents", "done"] = torch.full(
-            (self.n_agents, 1), done, dtype=torch.bool
-        )
+        td["agents", "done"] = torch.full((self.n_agents, 1), done, dtype=torch.bool)
 
         return td
 
@@ -305,9 +303,7 @@ class TrafficSignalEnv:
         phase_onehot = torch.zeros(n_green, dtype=torch.float32)
         phase_onehot[action_idx] = 1.0
 
-        elapsed = torch.tensor(
-            [self._elapsed_green[tl_id]], dtype=torch.float32
-        )
+        elapsed = torch.tensor([self._elapsed_green[tl_id]], dtype=torch.float32)
 
         return torch.cat([queue, wait, occ, speed, phase_onehot, elapsed])
 
@@ -319,18 +315,10 @@ class TrafficSignalEnv:
         for tl_id in self.tl_ids:
             lanes = self._controlled_lanes[tl_id]
             m = IntersectionMetrics(
-                queue_lengths=[
-                    self.adapter.get_lane_halting_number(l) for l in lanes
-                ],
-                waiting_times=[
-                    self.adapter.get_lane_waiting_time(l) for l in lanes
-                ],
-                mean_speeds=[
-                    self.adapter.get_lane_mean_speed(l) for l in lanes
-                ],
-                occupancies=[
-                    self.adapter.get_lane_occupancy(l) for l in lanes
-                ],
+                queue_lengths=[self.adapter.get_lane_halting_number(l) for l in lanes],
+                waiting_times=[self.adapter.get_lane_waiting_time(l) for l in lanes],
+                mean_speeds=[self.adapter.get_lane_mean_speed(l) for l in lanes],
+                occupancies=[self.adapter.get_lane_occupancy(l) for l in lanes],
             )
             metrics_list.append(m)
         return self.reward_calc.compute_batch(metrics_list)
@@ -360,24 +348,23 @@ class TrafficSignalEnv:
     def _apply_transitions(self) -> None:
         """Apply yellow/all-red/green transitions via the FSM controller."""
         for tl_id in self.tl_ids:
-            # Ask the FSM what phase to display right now
             phase = self.constraints.phase_to_apply(tl_id)
             if phase is not None:
                 self.adapter.set_phase(tl_id, phase)
 
-            # Advance the FSM timer
             done = self.constraints.tick(tl_id, seconds=1)
-            if done:
-                # Transition complete — apply destination green
+            if done and self.constraints.in_transition(tl_id):
                 dest = self.constraints.destination_green(tl_id)
                 if dest is not None:
                     self.adapter.set_phase(tl_id, dest)
                     self._current_green[tl_id] = dest
                     self._elapsed_green[tl_id] = 0.0
+                    self.constraints.complete_switch(tl_id)
+                else:
+                    # No actual switch was pending; still clear if idle
+                    self.constraints.complete_switch(tl_id)
 
-    def _build_transition_maps(
-        self, tl_id: str, num_phases: int
-    ) -> tuple[
+    def _build_transition_maps(self, tl_id: str, num_phases: int) -> tuple[
         dict[tuple[int, int], int],
         dict[tuple[int, int], int],
     ]:
@@ -394,7 +381,9 @@ class TrafficSignalEnv:
             return {}, {}
 
         phases = logics[0].phases
-        green_phases = self._green_phases.get(tl_id) or self._extract_green_phases(tl_id)
+        green_phases = self._green_phases.get(tl_id) or self._extract_green_phases(
+            tl_id
+        )
 
         yellow_map: dict[tuple[int, int], int] = {}
         all_red_map: dict[tuple[int, int], int] = {}

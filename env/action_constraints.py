@@ -316,14 +316,9 @@ class ActionConstraints:
     def tick(self, tl_id: str, seconds: int = 1) -> bool:
         """Advance the transition FSM by *seconds*.
 
-        Returns ``True`` when the transition is complete (destination green
-        should now be applied) or when no transition is active.
-
-        The caller should:
-
-        1. Call :meth:`phase_to_apply` to get what to set in SUMO.
-        2. Call :meth:`tick` to advance the timer.
-        3. When ``tick`` returns ``True``, finalize the switch.
+        Returns True when the transition has completed clearance and the
+        destination green should now be applied. The transition remains
+        available in 'idle' state until complete_switch() is called.
         """
         state = self._agent_state[tl_id]
         plan = state.transition
@@ -331,19 +326,25 @@ class ActionConstraints:
             return True
 
         if plan.stage == "idle":
-            state.transition = None
             return True
 
         plan.timer -= seconds
         if plan.timer > 0:
             return False
 
-        # Current stage exhausted → advance to next stage
         if plan.stage == "yellow" and plan.all_red_phase is not None:
             plan.stage = "all_red"
             plan.timer = self.all_red_duration
             return False
 
-        # All clearance stages done
-        state.transition = None
+        # Clearance finished: keep transition alive until env finalizes it
+        plan.stage = "idle"
+        plan.timer = 0
         return True
+
+    def complete_switch(self, tl_id: str) -> None:
+        """Clear a completed transition after the destination green is applied."""
+        state = self._agent_state[tl_id]
+        plan = state.transition
+        if plan is not None and plan.stage == "idle":
+            state.transition = None
