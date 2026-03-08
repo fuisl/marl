@@ -10,7 +10,7 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
-from env.sumo_env import TrafficSignalEnv
+from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 
 

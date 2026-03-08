@@ -13,7 +13,7 @@ from pathlib import Path
 import torch
 import yaml
 
-from env.sumo_env import TrafficSignalEnv
+from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 from rl.rollout import RolloutWorker
 from train.lightning_module import TrafficMARLModule

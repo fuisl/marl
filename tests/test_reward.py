@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from env.reward import IntersectionMetrics, RewardCalculator
+from marl_env.reward import IntersectionMetrics, RewardCalculator
 
 
 def test_queue_reward() -> None:

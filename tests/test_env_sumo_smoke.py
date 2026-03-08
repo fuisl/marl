@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from env.sumo_env import TrafficSignalEnv
+from marl_env.sumo_env import TrafficSignalEnv
 
 
 def _build_net_from_nodes_edges(

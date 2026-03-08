@@ -14,7 +14,7 @@ import argparse
 
 import yaml
 
-from env.sumo_env import TrafficSignalEnv
+from marl_env.sumo_env import TrafficSignalEnv
 
 
 def run_baseline(env_cfg: dict) -> dict[str, float]:

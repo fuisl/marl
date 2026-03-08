@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from env.action_constraints import ActionConstraints
+from marl_env.action_constraints import ActionConstraints
 
 
 def make_constraints() -> ActionConstraints:

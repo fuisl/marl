@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
-from env.sumo_env import TrafficSignalEnv
+from marl_env.sumo_env import TrafficSignalEnv
 
 
 class FakePhase:
@@ -117,7 +117,7 @@ def _sample_valid_actions(mask: torch.Tensor) -> torch.Tensor:
 
 
 def _make_env(monkeypatch: object, done_after: int = 20) -> TrafficSignalEnv:
-    import env.sumo_env as sumo_env_mod
+    import marl_env.sumo_env as sumo_env_mod
 
     monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
     env = TrafficSignalEnv(

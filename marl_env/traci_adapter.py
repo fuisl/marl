@@ -13,7 +13,7 @@ from typing import Any
 _USING_LIBSUMO = "LIBSUMO_AS_TRACI" in os.environ
 
 if _USING_LIBSUMO:
-    import libsumo as traci  # type: ignore[import-untyped]x
+    import libsumo as traci  # type: ignore[import-untyped]
 else:
     import traci  # type: ignore[import-untyped]
 

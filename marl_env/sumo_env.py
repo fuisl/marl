@@ -12,10 +12,10 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
-from env.action_constraints import ActionConstraints
-from env.graph_builder import GraphBuilder
-from env.reward import IntersectionMetrics, RewardCalculator
-from env.traci_adapter import TraCIAdapter
+from marl_env.action_constraints import ActionConstraints
+from marl_env.graph_builder import GraphBuilder
+from marl_env.reward import IntersectionMetrics, RewardCalculator
+from marl_env.traci_adapter import TraCIAdapter
 
 
 class TrafficSignalEnv:

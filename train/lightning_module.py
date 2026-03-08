@@ -26,7 +26,7 @@ from models.marl_discrete_sac import MARLDiscreteSAC
 from rl.losses import DiscreteSACLossComputer, SACLossOutput
 from rl.replay import make_replay_buffer
 from rl.rollout import RolloutWorker
-from env.sumo_env import TrafficSignalEnv
+from marl_env.sumo_env import TrafficSignalEnv
 
 
 class TrafficMARLModule(L.LightningModule):
