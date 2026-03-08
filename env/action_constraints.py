@@ -16,8 +16,7 @@ simulation second: *"What SUMO phase should I apply right now?"*
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
 import torch
 from torch import Tensor
@@ -157,13 +156,31 @@ class ActionConstraints:
         action_to_green = {i: p for i, p in enumerate(green_phase_indices)}
         green_to_action = {p: i for i, p in enumerate(green_phase_indices)}
 
+        yellow_phase_map = yellow_phase_map or {}
+        all_red_phase_map = all_red_phase_map or {}
+        for map_name, mapping in [
+            ("yellow_phase_map", yellow_phase_map),
+            ("all_red_phase_map", all_red_phase_map),
+        ]:
+            for (src, dst), phase in mapping.items():
+                if src not in green_to_action or dst not in green_to_action:
+                    raise ValueError(
+                        f"{tl_id}: invalid {map_name} key {(src, dst)}; "
+                        f"both must be registered green phases."
+                    )
+                if not (0 <= phase < num_phases):
+                    raise ValueError(
+                        f"{tl_id}: invalid {map_name} value {phase}; "
+                        f"must be in [0, {num_phases - 1}]."
+                    )
+
         self._agent_state[tl_id] = _AgentState(
             num_phases=num_phases,
             green_phase_indices=green_phase_indices,
             action_to_green=action_to_green,
             green_to_action=green_to_action,
-            yellow_phase_map=yellow_phase_map or {},
-            all_red_phase_map=all_red_phase_map or {},
+            yellow_phase_map=yellow_phase_map,
+            all_red_phase_map=all_red_phase_map,
         )
 
     # ------------------------------------------------------------------
@@ -251,6 +268,11 @@ class ActionConstraints:
             **RL action index** of the desired green.
         """
         state = self._agent_state[tl_id]
+        if target_action not in state.action_to_green:
+            raise ValueError(
+                f"{tl_id}: invalid target_action {target_action}; "
+                f"must be in [0, {len(state.action_to_green) - 1}]."
+            )
         target_green_phase = state.action_to_green[target_action]
 
         # Same phase → nothing to do

@@ -100,6 +100,8 @@ class TrafficSignalEnv:
         self._controlled_lanes: dict[str, list[str]] = {}
         self._elapsed_green: dict[str, float] = {}
         self._current_green: dict[str, int] = {}
+        self._max_lanes: int = 0
+        self._max_green: int = 0
 
     # ==================================================================
     # Core gym-like interface
@@ -142,6 +144,14 @@ class TrafficSignalEnv:
                 all_red_phase_map=all_red_map,
             )
 
+        # Fixed observation dimensions (for padding)
+        self._max_lanes = max(
+            len(self._controlled_lanes[tl]) for tl in self.tl_ids
+        )
+        self._max_green = max(
+            len(self._green_phases[tl]) for tl in self.tl_ids
+        )
+
         return self._build_tensordict()
 
     def step(self, actions: Tensor) -> TensorDict:
@@ -165,24 +175,11 @@ class TrafficSignalEnv:
 
             if not self.constraints.in_transition(tl_id):
                 self.constraints.begin_switch(tl_id, current_green, action_idx)
-                # If no switch needed, begin_switch is a no-op
-                if not self.constraints.in_transition(tl_id):
-                    self._elapsed_green[tl_id] += self.delta_t
 
         # --- Advance simulation by delta_t seconds ---
         for _ in range(self.delta_t):
             self._apply_transitions()
             self.adapter.simulation_step()
-
-        # --- Finalize phase state after stepping ---
-        for tl_id in self.tl_ids:
-            if not self.constraints.in_transition(tl_id):
-                dest = self.constraints.destination_green(tl_id)
-                if dest is not None:
-                    # Transition just completed on a previous tick
-                    self._current_green[tl_id] = dest
-                    self._elapsed_green[tl_id] = 0.0
-                # else: no transition was active, current_green stays
 
         # --- Build output ---
         td = self._build_tensordict()
@@ -206,12 +203,13 @@ class TrafficSignalEnv:
     # ==================================================================
     @property
     def observation_dim(self) -> int:
-        """Dimension of per-agent observation vector."""
-        # queue(n_lanes) + wait(n_lanes) + occupancy(n_lanes) +
-        # speed(n_lanes) + phase_onehot(n_green) + elapsed(1)
-        # The actual dim depends on max_lanes and max_green_phases.
-        # This is a placeholder; real value set after first reset.
-        return self._obs_dim
+        """Dimension of per-agent observation vector.
+
+        ``4 * max_lanes + max_green + 1``
+        (queue + wait + occupancy + speed, per lane, padded)
+        (phase one-hot, padded) + elapsed green.
+        """
+        return 4 * self._max_lanes + self._max_green + 1
 
     @property
     def num_actions(self) -> int:
@@ -227,7 +225,6 @@ class TrafficSignalEnv:
             obs_list.append(self._get_observation(tl_id))
 
         obs = torch.stack(obs_list, dim=0)  # [n_agents, d_obs]
-        self._obs_dim = obs.shape[-1]
 
         # Action masks
         masks: list[Tensor] = []
@@ -264,46 +261,57 @@ class TrafficSignalEnv:
 
         return td
 
+    # ==================================================================
+    # Observation helpers
+    # ==================================================================
+    @staticmethod
+    def _pad_1d(values: list[float], target_len: int) -> Tensor:
+        """Pad or truncate a list of floats to ``target_len``."""
+        t = torch.tensor(values, dtype=torch.float32)
+        if t.numel() < target_len:
+            t = torch.cat(
+                [t, torch.zeros(target_len - t.numel(), dtype=torch.float32)]
+            )
+        else:
+            t = t[:target_len]
+        return t
+
     def _get_observation(self, tl_id: str) -> Tensor:
         """Build observation vector for one intersection.
 
-        Features per controlled lane:
-            queue_length, waiting_time, occupancy, mean_speed
+        Layout (padded to uniform size)::
 
-        Plus global agent features:
-            current_phase (one-hot), elapsed_green (scalar)
+            [queue(max_lanes) | wait(max_lanes) | occ(max_lanes)
+             | speed(max_lanes) | phase_onehot(max_green) | elapsed(1)]
         """
         lanes = self._controlled_lanes[tl_id]
-        n_lanes = len(lanes)
+        ml = self._max_lanes
 
-        queue = torch.tensor(
-            [self.adapter.get_lane_halting_number(l) for l in lanes],
-            dtype=torch.float32,
+        queue = self._pad_1d(
+            [self.adapter.get_lane_halting_number(l) for l in lanes], ml
         )
-        wait = torch.tensor(
-            [self.adapter.get_lane_waiting_time(l) for l in lanes],
-            dtype=torch.float32,
+        wait = self._pad_1d(
+            [self.adapter.get_lane_waiting_time(l) for l in lanes], ml
         )
-        occ = torch.tensor(
-            [self.adapter.get_lane_occupancy(l) for l in lanes],
-            dtype=torch.float32,
+        occ = self._pad_1d(
+            [self.adapter.get_lane_occupancy(l) for l in lanes], ml
         )
-        speed = torch.tensor(
-            [self.adapter.get_lane_mean_speed(l) for l in lanes],
-            dtype=torch.float32,
+        speed = self._pad_1d(
+            [self.adapter.get_lane_mean_speed(l) for l in lanes], ml
         )
 
-        # Phase one-hot (uses precomputed mapping for O(1) lookup)
-        n_green = len(self._green_phases[tl_id])
+        # Phase one-hot (padded to max_green)
         current_gp = self._current_green[tl_id]
         if current_gp in self._green_phases[tl_id]:
             action_idx = self.constraints.green_phase_to_action(tl_id, current_gp)
         else:
             action_idx = 0
-        phase_onehot = torch.zeros(n_green, dtype=torch.float32)
+        phase_onehot = torch.zeros(self._max_green, dtype=torch.float32)
         phase_onehot[action_idx] = 1.0
 
-        elapsed = torch.tensor([self._elapsed_green[tl_id]], dtype=torch.float32)
+        elapsed = torch.tensor(
+            [self._elapsed_green[tl_id]], dtype=torch.float32
+        )
 
         return torch.cat([queue, wait, occ, speed, phase_onehot, elapsed])
 
@@ -348,21 +356,21 @@ class TrafficSignalEnv:
     def _apply_transitions(self) -> None:
         """Apply yellow/all-red/green transitions via the FSM controller."""
         for tl_id in self.tl_ids:
-            phase = self.constraints.phase_to_apply(tl_id)
-            if phase is not None:
-                self.adapter.set_phase(tl_id, phase)
+            if self.constraints.in_transition(tl_id):
+                phase = self.constraints.phase_to_apply(tl_id)
+                if phase is not None:
+                    self.adapter.set_phase(tl_id, phase)
 
-            done = self.constraints.tick(tl_id, seconds=1)
-            if done and self.constraints.in_transition(tl_id):
-                dest = self.constraints.destination_green(tl_id)
-                if dest is not None:
-                    self.adapter.set_phase(tl_id, dest)
-                    self._current_green[tl_id] = dest
-                    self._elapsed_green[tl_id] = 0.0
+                done = self.constraints.tick(tl_id, seconds=1)
+                if done:
+                    dest = self.constraints.destination_green(tl_id)
+                    if dest is not None:
+                        self.adapter.set_phase(tl_id, dest)
+                        self._current_green[tl_id] = dest
+                        self._elapsed_green[tl_id] = 0.0
                     self.constraints.complete_switch(tl_id)
-                else:
-                    # No actual switch was pending; still clear if idle
-                    self.constraints.complete_switch(tl_id)
+            else:
+                self._elapsed_green[tl_id] += 1.0
 
     def _build_transition_maps(self, tl_id: str, num_phases: int) -> tuple[
         dict[tuple[int, int], int],

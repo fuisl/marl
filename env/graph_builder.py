@@ -63,7 +63,10 @@ class GraphBuilder:
                 if nbr_id not in self._id_to_idx:
                     continue
                 dst_idx = self._id_to_idx[nbr_id]
-                # Undirected: add both directions
+                # One direction per iteration; the reverse is added
+                # when the neighbor node is processed as src_idx,
+                # since _get_neighbor_tl_ids scans both incoming
+                # and outgoing edges.
                 src_list.append(src_idx)
                 dst_list.append(dst_idx)
                 attrs.append([dist, float(n_lanes)])
