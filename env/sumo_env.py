@@ -189,7 +189,10 @@ class TrafficSignalEnv:
         td["agents", "reward"] = rewards.unsqueeze(-1)  # [n_agents, 1]
 
         # Done
-        done = self.adapter.min_expected_vehicles == 0
+        done = (
+            self.adapter.current_time >= self.adapter.end_time
+            or self.adapter.min_expected_vehicles == 0
+        )
         td["done"] = torch.tensor([done], dtype=torch.bool)
         td["agents", "done"] = torch.full((self.n_agents, 1), done, dtype=torch.bool)
 
