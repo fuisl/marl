@@ -119,16 +119,27 @@ class TrafficSignalEnv:
 
         # Cache phase info & register constraints per agent
         for tl_id in self.tl_ids:
+            num_phases = self._get_num_phases(tl_id)
             green_phases = self._extract_green_phases(tl_id)
+            yellow_map, all_red_map = self._build_transition_maps(tl_id, num_phases)
+
             self._green_phases[tl_id] = green_phases
             self._controlled_lanes[tl_id] = self.adapter.get_controlled_lanes(tl_id)
             self._elapsed_green[tl_id] = 0.0
-            self._current_green[tl_id] = self.adapter.get_phase(tl_id)
+
+            # Snap initial phase to the nearest controllable green
+            raw_phase = self.adapter.get_phase(tl_id)
+            if raw_phase in green_phases:
+                self._current_green[tl_id] = raw_phase
+            else:
+                self._current_green[tl_id] = green_phases[0]
 
             self.constraints.register_agent(
                 tl_id,
-                num_phases=self._get_num_phases(tl_id),
+                num_phases=num_phases,
                 green_phase_indices=green_phases,
+                yellow_phase_map=yellow_map,
+                all_red_phase_map=all_red_map,
             )
 
         return self._build_tensordict()
@@ -149,29 +160,29 @@ class TrafficSignalEnv:
         """
         # --- Apply actions (with yellow transition logic) ---
         for i, tl_id in enumerate(self.tl_ids):
-            desired_green = self._green_phases[tl_id][int(actions[i].item())]
+            action_idx = int(actions[i].item())
             current_green = self._current_green[tl_id]
 
-            if self.constraints.needs_transition(tl_id, current_green, desired_green):
-                self.constraints.start_transition(tl_id, desired_green)
-                # Will set yellow in _apply_transition below
-            else:
-                self._elapsed_green[tl_id] += self.delta_t
+            if not self.constraints.in_transition(tl_id):
+                self.constraints.begin_switch(tl_id, current_green, action_idx)
+                # If no switch needed, begin_switch is a no-op
+                if not self.constraints.in_transition(tl_id):
+                    self._elapsed_green[tl_id] += self.delta_t
 
         # --- Advance simulation by delta_t seconds ---
         for _ in range(self.delta_t):
             self._apply_transitions()
             self.adapter.simulation_step()
 
-        # --- Update current green phases after transitions ---
+        # --- Finalize phase state after stepping ---
         for tl_id in self.tl_ids:
-            dest = self.constraints.get_transition_phase_idx(tl_id)
-            if dest is None:
-                self._current_green[tl_id] = self.adapter.get_phase(tl_id)
-                # Don't reset elapsed — it was accumulated above
-            else:
-                self._current_green[tl_id] = dest
-                self._elapsed_green[tl_id] = 0.0
+            if not self.constraints.in_transition(tl_id):
+                dest = self.constraints.destination_green(tl_id)
+                if dest is not None:
+                    # Transition just completed on a previous tick
+                    self._current_green[tl_id] = dest
+                    self._elapsed_green[tl_id] = 0.0
+                # else: no transition was active, current_green stays
 
         # --- Build output ---
         td = self._build_tensordict()
@@ -284,13 +295,15 @@ class TrafficSignalEnv:
             dtype=torch.float32,
         )
 
-        # Phase one-hot
+        # Phase one-hot (uses precomputed mapping for O(1) lookup)
         n_green = len(self._green_phases[tl_id])
-        phase_idx = self._green_phases[tl_id].index(
-            self._current_green[tl_id]
-        ) if self._current_green[tl_id] in self._green_phases[tl_id] else 0
+        current_gp = self._current_green[tl_id]
+        if current_gp in self._green_phases[tl_id]:
+            action_idx = self.constraints.green_phase_to_action(tl_id, current_gp)
+        else:
+            action_idx = 0
         phase_onehot = torch.zeros(n_green, dtype=torch.float32)
-        phase_onehot[phase_idx] = 1.0
+        phase_onehot[action_idx] = 1.0
 
         elapsed = torch.tensor(
             [self._elapsed_green[tl_id]], dtype=torch.float32
@@ -345,12 +358,60 @@ class TrafficSignalEnv:
         return len(logics[0].phases)
 
     def _apply_transitions(self) -> None:
-        """Apply yellow/all-red transitions for agents mid-switch."""
+        """Apply yellow/all-red/green transitions via the FSM controller."""
         for tl_id in self.tl_ids:
-            done = self.constraints.tick_transition(tl_id, seconds=1)
-            dest = self.constraints.get_transition_phase_idx(tl_id)
-            if dest is not None and done:
-                self.adapter.set_phase(tl_id, dest)
-            elif dest is not None:
-                # Still in yellow/all-red — SUMO handles the actual phase
-                pass
+            # Ask the FSM what phase to display right now
+            phase = self.constraints.phase_to_apply(tl_id)
+            if phase is not None:
+                self.adapter.set_phase(tl_id, phase)
+
+            # Advance the FSM timer
+            done = self.constraints.tick(tl_id, seconds=1)
+            if done:
+                # Transition complete — apply destination green
+                dest = self.constraints.destination_green(tl_id)
+                if dest is not None:
+                    self.adapter.set_phase(tl_id, dest)
+                    self._current_green[tl_id] = dest
+                    self._elapsed_green[tl_id] = 0.0
+
+    def _build_transition_maps(
+        self, tl_id: str, num_phases: int
+    ) -> tuple[
+        dict[tuple[int, int], int],
+        dict[tuple[int, int], int],
+    ]:
+        """Infer yellow and all-red phase mappings from the SUMO program.
+
+        Heuristic: for each pair of consecutive green phases in the program,
+        phases between them that contain 'y' are yellow, and phases that are
+        all 'r' are all-red.
+
+        Returns ``(yellow_phase_map, all_red_phase_map)``.
+        """
+        logics = self.adapter.get_program_logic(tl_id)
+        if not logics:
+            return {}, {}
+
+        phases = logics[0].phases
+        green_phases = self._green_phases.get(tl_id) or self._extract_green_phases(tl_id)
+
+        yellow_map: dict[tuple[int, int], int] = {}
+        all_red_map: dict[tuple[int, int], int] = {}
+
+        # Walk through the program and associate intermediate phases
+        for gi in range(len(green_phases)):
+            from_gp = green_phases[gi]
+            to_gp = green_phases[(gi + 1) % len(green_phases)]
+
+            # Scan phases between from_gp and to_gp (wrapping around)
+            idx = (from_gp + 1) % num_phases
+            while idx != to_gp:
+                state = phases[idx].state
+                if "y" in state or "Y" in state:
+                    yellow_map.setdefault((from_gp, to_gp), idx)
+                elif all(c in ("r", "R") for c in state):
+                    all_red_map.setdefault((from_gp, to_gp), idx)
+                idx = (idx + 1) % num_phases
+
+        return yellow_map, all_red_map
