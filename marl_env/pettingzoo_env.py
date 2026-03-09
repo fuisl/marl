@@ -6,7 +6,6 @@ adapts the I/O contract to PettingZoo's Parallel API.
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any
 
 import numpy as np
@@ -83,22 +82,27 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 		self.agent_name_mapping: dict[str, int] = {}
 		self.agent_to_index: dict[str, int] = {}
 
+		if self.core.tl_ids:
+			self.possible_agents = list(self.core.tl_ids)
+			self.agent_name_mapping = {
+				agent: i for i, agent in enumerate(self.possible_agents)
+			}
+			self.agent_to_index = dict(self.agent_name_mapping)
+
 		self._action_spaces: dict[str, Any] = {}
 		self._observation_spaces: dict[str, Any] = {}
 		self._num_actions_by_agent: dict[str, int] = {}
-		self._last_action_mask: np.ndarray | None = None
+		self._last_action_mask: dict[str, np.ndarray] = {}
 		self._initialized = False
 
 		# Static graph metadata, exposed as helper accessors.
 		self.edge_index: torch.Tensor | None = None
 		self.edge_attr: torch.Tensor | None = None
 
-	@lru_cache(maxsize=None)
 	def observation_space(self, agent: str) -> Any:
 		self._ensure_ready_for_spaces(agent)
 		return self._observation_spaces[agent]
 
-	@lru_cache(maxsize=None)
 	def action_space(self, agent: str) -> Any:
 		self._ensure_ready_for_spaces(agent)
 		return self._action_spaces[agent]
@@ -138,7 +142,7 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 		td = self.core.step(action_tensor)
 		observations, infos = self._build_obs_infos(td)
 		rewards = self._build_rewards(td, penalties)
-		terminations, truncations = self._build_done_flags()
+		terminations, truncations = self._build_done_flags(td)
 
 		if all(terminations.values()) or all(truncations.values()):
 			self.agents = []
@@ -170,14 +174,14 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 			self.agent_to_index = dict(self.agent_name_mapping)
 
 			obs_dim = int(self.core.observation_dim)
-			num_actions = int(self.core.num_actions)
 			assert spaces is not None
 
 			self._num_actions_by_agent = {
 				agent: len(self.core._green_phases[agent]) for agent in current_ids
 			}
 			for agent in current_ids:
-				self._action_spaces[agent] = spaces.Discrete(num_actions)
+				n_actions = self._num_actions_by_agent[agent]
+				self._action_spaces[agent] = spaces.Discrete(n_actions)
 				self._observation_spaces[agent] = spaces.Dict(
 					{
 						"observation": spaces.Box(
@@ -189,7 +193,7 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 						"action_mask": spaces.Box(
 							low=0,
 							high=1,
-							shape=(num_actions,),
+							shape=(n_actions,),
 							dtype=np.int8,
 						),
 					}
@@ -217,17 +221,18 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 		self, td: Any
 	) -> tuple[dict[str, dict[str, np.ndarray]], dict[str, dict[str, Any]]]:
 		obs_arr = td["agents", "observation"].detach().cpu().numpy().astype(np.float32)
-		mask_arr = (
-			td["agents", "action_mask"].detach().cpu().numpy().astype(np.int8)
-		)
-		self._last_action_mask = mask_arr.copy()
+		mask_arr = td["agents", "action_mask"].detach().cpu().numpy().astype(np.int8)
 
 		observations: dict[str, dict[str, np.ndarray]] = {}
 		infos: dict[str, dict[str, Any]] = {}
+		self._last_action_mask = {}
 		for i, agent in enumerate(self.agents):
+			n_actions = self._num_actions_by_agent[agent]
+			agent_mask = mask_arr[i, :n_actions].copy()
+			self._last_action_mask[agent] = agent_mask
 			observations[agent] = {
 				"observation": obs_arr[i],
-				"action_mask": mask_arr[i],
+				"action_mask": agent_mask,
 			}
 			infos[agent] = {}
 		return observations, infos
@@ -241,17 +246,35 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 			rewards[agent] = float(reward_arr[i] + penalties.get(agent, 0.0))
 		return rewards
 
-	def _build_done_flags(self) -> tuple[dict[str, bool], dict[str, bool]]:
-		is_terminated = self.core.adapter.min_expected_vehicles == 0
-		is_truncated = self.core.adapter.current_time >= self.core.adapter.end_time
-		terminations = {agent: bool(is_terminated) for agent in self.agents}
-		truncations = {agent: bool(is_truncated) for agent in self.agents}
+	def _build_done_flags(self, td: Any) -> tuple[dict[str, bool], dict[str, bool]]:
+		terminations: dict[str, bool] = {}
+		truncations: dict[str, bool] = {}
+
+		if td.get(("agents", "terminated"), None) is not None:
+			terminated_arr = td["agents", "terminated"].detach().cpu().numpy().reshape(-1)
+			truncated_arr = td["agents", "truncated"].detach().cpu().numpy().reshape(-1)
+			for i, agent in enumerate(self.agents):
+				terminations[agent] = bool(terminated_arr[i])
+				truncations[agent] = bool(truncated_arr[i])
+			return terminations, truncations
+
+		if td.get(("agents", "done"), None) is not None:
+			done_arr = td["agents", "done"].detach().cpu().numpy().reshape(-1)
+			for i, agent in enumerate(self.agents):
+				terminations[agent] = bool(done_arr[i])
+				truncations[agent] = False
+			return terminations, truncations
+
+		is_done = bool(td.get("done", torch.tensor([False])).item())
+		for agent in self.agents:
+			terminations[agent] = is_done
+			truncations[agent] = False
 		return terminations, truncations
 
 	def _encode_actions(
 		self, actions: dict[str, int]
 	) -> tuple[torch.Tensor, dict[str, float]]:
-		if self._last_action_mask is None:
+		if not self._last_action_mask:
 			raise RuntimeError("No action mask available. Call reset() before step().")
 
 		encoded: list[int] = []
@@ -259,7 +282,7 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
 
 		for i, agent in enumerate(self.agents):
 			action = int(actions[agent])
-			mask = self._last_action_mask[i]
+			mask = self._last_action_mask[agent]
 			legal = 0 <= action < mask.shape[0] and bool(mask[action])
 
 			if not legal:

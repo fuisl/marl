@@ -98,6 +98,25 @@ class FakeTraCIAdapter:
         return 5.0 if lane_id.endswith("1") else 6.0
 
 
+class FakeTraCIAdapterHeteroActions(FakeTraCIAdapter):
+    def get_program_logic(self, tl_id: str) -> list[FakeLogic]:
+        if tl_id == "J1":
+            # Two controllable greens: phases 0 and 3
+            return super().get_program_logic(tl_id)
+
+        # One controllable green: phase 0 only
+        return [
+            FakeLogic(
+                [
+                    FakePhase("GrGr"),
+                    FakePhase("yryr"),
+                    FakePhase("rrrr"),
+                    FakePhase("rrrr"),
+                ]
+            )
+        ]
+
+
 class FakeGraphBuilder:
     def __init__(self, net_file: str, tl_ids: list[str]) -> None:
         self.net_file = net_file
@@ -125,6 +144,24 @@ def _make_env(monkeypatch: object, done_after: int = 20):
         min_green_duration=0,
     )
     core.adapter = FakeTraCIAdapter(done_after=done_after)
+
+    return SumoTrafficParallelEnv(core_env=core)
+
+
+def _make_env_hetero_actions(monkeypatch: object, done_after: int = 20):
+    from marl_env.sumo_env import TrafficSignalEnv
+    import marl_env.sumo_env as sumo_env_mod
+
+    SumoTrafficParallelEnv = _import_parallel_env_or_skip()
+    monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
+
+    core = TrafficSignalEnv(
+        net_file="dummy.net.xml",
+        route_file="dummy.rou.xml",
+        delta_t=1,
+        min_green_duration=0,
+    )
+    core.adapter = FakeTraCIAdapterHeteroActions(done_after=done_after)
 
     return SumoTrafficParallelEnv(core_env=core)
 
@@ -194,6 +231,16 @@ def test_space_methods_available_after_reset(monkeypatch: object) -> None:
         assert "observation" in obs_space.spaces
         assert "action_mask" in obs_space.spaces
         assert act_space.n >= 1
+
+
+def test_per_agent_action_space_and_mask_shapes(monkeypatch: object) -> None:
+    env = _make_env_hetero_actions(monkeypatch, done_after=10)
+    observations, _ = env.reset()
+
+    for agent in env.possible_agents:
+        expected_n = len(env.core._green_phases[agent])
+        assert env.action_space(agent).n == expected_n
+        assert observations[agent]["action_mask"].shape == (expected_n,)
 
 
 def test_parallel_api_compliance(monkeypatch: object) -> None:
