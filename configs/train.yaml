@@ -1,0 +1,28 @@
+# =============================================================
+# Training configuration
+# =============================================================
+
+# Reproducibility
+seed: 42
+
+# Optimizers
+lr_actor: 3.0e-4
+lr_critic: 3.0e-4
+lr_alpha: 3.0e-4
+
+# SAC
+gamma: 0.99
+
+# Replay buffer
+replay_capacity: 100000
+batch_size: 256
+
+# Training schedule
+max_epochs: 200
+steps_per_epoch: 100          # env steps collected per training iteration
+warmup_steps: 1000            # fill replay before first gradient update
+updates_per_step: 1           # gradient updates per training_step call
+target_update_freq: 1         # soft-update target every N gradient steps
+
+# Evaluation
+eval_interval: 10             # run validation every N epochs
