@@ -1,22 +1,27 @@
-# `marl_env` Implementation Diagrams
+# Current MARL Implementation Diagrams
 
-This report documents how `marl_env` is implemented and how it connects to the rest of the project.
+This report documents the current end-to-end architecture and the baseline training path used in this repository.
 
 ## 1. System Context in the Project
 
 ```mermaid
 flowchart TB
+  Hydra[Hydra Configs\nconfigs/*.yaml]
+
   subgraph EntryPoints[Entry Points]
-    Train[train/train.py]
+    GATBaseline[scripts/train_gat_baseline.py]
+    LightningTrain[train/train.py]
     Eval[train/evaluate.py]
-    Baseline[scripts/run_sumo_baseline.py]
+    SUMOBaseline[scripts/run_sumo_baseline.py]
   end
 
   subgraph TrainStack[Training Stack]
     Lightning[TrafficMARLModule\ntrain/lightning_module.py]
+    ManualLoop[Manual SAC Loop\nReplay + Update\nscripts/train_gat_baseline.py]
     Rollout[RolloutWorker\nrl/rollout.py]
     Replay[TensorDictReplayBuffer\nrl/replay.py]
     Loss[DiscreteSACLossComputer\nrl/losses.py]
+    Opt[make_optimizer\nAdam or MetaAdam\nrl/optimizers.py]
   end
 
   subgraph ModelStack[Model Stack]
@@ -36,14 +41,25 @@ flowchart TB
 
   SUMO[SUMO Simulator\nTraCI or libsumo]
 
-  Train --> Lightning
+  Hydra --> GATBaseline
+  Hydra --> LightningTrain
+  Hydra --> Eval
+  Hydra --> SUMOBaseline
+
+  GATBaseline --> ManualLoop
+  LightningTrain --> Lightning
   Eval --> Lightning
-  Baseline --> Env
+  SUMOBaseline --> Env
 
   Lightning --> Rollout
   Lightning --> Replay
   Lightning --> Loss
   Lightning --> Agent
+
+  ManualLoop --> Replay
+  ManualLoop --> Loss
+  ManualLoop --> Agent
+  ManualLoop --> Opt
 
   Rollout --> Env
   Rollout --> Agent
@@ -61,7 +77,63 @@ flowchart TB
   TA <--> SUMO
 ```
 
-## 2. `marl_env` Internal Module Dependency Map
+## 2. Baseline Architecture (Current)
+
+The current baseline is `scripts/train_gat_baseline.py` with Hydra-driven config, graph encoder + Discrete SAC, and optimizer selection through `rl/optimizers.py`.
+
+```mermaid
+flowchart LR
+  Cfg[configs/gat_baseline.yaml\n+ env/default\n+ model/default] --> Train[scripts/train_gat_baseline.py]
+  Train --> Env[TrafficSignalEnv]
+  Train --> Agent[MARLDiscreteSAC]
+  Train --> Loss[DiscreteSACLossComputer]
+  Train --> RB[ReplayBuffer\nFIFO ring buffer]
+  Train --> Opt[make_optimizer]
+
+  Agent --> Enc[GraphEncoder\n2x GATv2Conv]
+  Agent --> Act[SharedDiscreteActor]
+  Agent --> Crit[CentralizedTwinCritic\n+ target critic]
+
+  Opt --> Adam[Adam]
+  Opt --> Meta[MetaAdam\nscalar hypergradient LR]
+
+  Env --> SUMO[SUMO/libsumo via TraCIAdapter]
+  Loss --> Agent
+  RB --> Loss
+```
+
+## 3. Baseline Training Loop (One Episode + Updates)
+
+```mermaid
+sequenceDiagram
+  participant T as train_gat_baseline.py
+  participant E as TrafficSignalEnv
+  participant A as MARLDiscreteSAC
+  participant R as ReplayBuffer
+  participant L as DiscreteSACLossComputer
+  participant O as Optimizers (Adam/MetaAdam)
+
+  T->>E: reset()
+  loop until done
+    T->>A: select_action(obs, edge_index, edge_attr, action_mask)
+    A-->>T: actions
+    T->>E: step(actions)
+    E-->>T: next_td (reward, done, next obs)
+    T->>R: push(pack_transition(...))
+    alt replay has enough samples
+      T->>R: sample(batch)
+      R-->>T: transitions
+      T->>L: compute(batch)
+      L-->>T: critic_loss, actor_loss, alpha_loss
+      T->>O: critic step
+      T->>O: actor step
+      T->>O: alpha step
+      T->>A: soft_update_target()
+    end
+  end
+```
+
+## 4. `marl_env` Internal Module Dependency Map
 
 ```mermaid
 flowchart LR
@@ -82,7 +154,7 @@ flowchart LR
   graph_builder --> sumolib[sumolib]
 ```
 
-## 3. Core Class Diagram
+## 5. Core Class Diagram
 
 ```mermaid
 classDiagram
@@ -177,7 +249,7 @@ classDiagram
   _AgentState --> TransitionPlan
 ```
 
-## 4. `reset()` Runtime Sequence
+## 6. `reset()` Runtime Sequence
 
 ```mermaid
 sequenceDiagram
@@ -211,7 +283,7 @@ sequenceDiagram
   E-->>C: TensorDict{agents/observation, agents/action_mask, edge_index, edge_attr?}
 ```
 
-## 5. `step(actions)` Runtime Sequence
+## 7. `step(actions)` Runtime Sequence
 
 ```mermaid
 sequenceDiagram
@@ -266,7 +338,7 @@ sequenceDiagram
   E-->>C: TensorDict + reward + done flags
 ```
 
-## 6. Action Transition FSM (`ActionConstraints`)
+## 8. Action Transition FSM (`ActionConstraints`)
 
 ```mermaid
 stateDiagram-v2
@@ -291,7 +363,7 @@ stateDiagram-v2
   ReadyToCommit --> NoTransition: env sets destination green + complete_switch()
 ```
 
-## 7. Action-Mask Decision Logic
+## 9. Action-Mask Decision Logic
 
 ```mermaid
 flowchart TD
@@ -308,7 +380,7 @@ flowchart TD
   AllOpen --> End
 ```
 
-## 8. Observation Vector Construction
+## 10. Observation Vector Construction
 
 ```mermaid
 flowchart LR
@@ -335,28 +407,28 @@ flowchart LR
   Cat --> Obs[observation_i\nshape: 4*max_lanes + max_green + 1]
 ```
 
-## 9. Environment Output `TensorDict` Schema
+## 11. Environment Output `TensorDict` Schema
 
 ```mermaid
 flowchart TB
-  TD[TensorDict\nbatch_size=[]]
+  TD[TensorDict\nroot batch]
 
-  TD --> Agents[agents\nTensorDict batch_size=[n_agents]]
-  TD --> EdgeIndex[edge_index\nshape=[2, E]]
-  TD --> EdgeAttr[edge_attr\nshape=[E, d_edge]\noptional]
-  TD --> DoneRoot[done\nshape=[1]\nbool (after step)]
+  TD --> Agents[agents\nTensorDict for all agents]
+  TD --> EdgeIndex[edge_index\nshape 2 by E]
+  TD --> EdgeAttr[edge_attr\nshape E by d_edge\noptional]
+  TD --> DoneRoot[done\nshape 1\nbool after step]
 
-  Agents --> Obs[observation\nshape=[n_agents, obs_dim]]
-  Agents --> Mask[action_mask\nshape=[n_agents, num_actions]]
-  Agents --> Reward[reward\nshape=[n_agents, 1]\n(after step)]
-  Agents --> DoneAgent[done\nshape=[n_agents, 1]\n(after step)]
+  Agents --> Obs[observation\nshape n_agents by obs_dim]
+  Agents --> Mask[action_mask\nshape n_agents by num_actions]
+  Agents --> Reward[reward\nshape n_agents by 1\nafter step]
+  Agents --> DoneAgent[done\nshape n_agents by 1\nafter step]
 ```
 
-## 10. Graph Topology Build Flow (`GraphBuilder`)
+## 12. Graph Topology Build Flow (`GraphBuilder`)
 
 ```mermaid
 flowchart TD
-  A[Inputs: net_file, tl_ids] --> B[sumolib.net.readNet(net_file)]
+  A[Inputs net_file and tl_ids] --> B[Load SUMO net]
   B --> C[Map tl_id -> node and index]
 
   C --> D{for each tl node}
@@ -366,39 +438,39 @@ flowchart TD
   E --> G[collect neighbor tl_id, edge length, lane count]
   F --> G
   G --> H[filter: neighbor must be in tl_ids and not seen]
-  H --> I[append src_idx, dst_idx, attr=[distance, n_lanes]]
+  H --> I[append src_idx dst_idx and attrs]
 
   I --> J{any edges collected?}
-  J -->|No| K[edge_index = zeros(2,0); edge_attr=None]
-  J -->|Yes| L[edge_index tensor [2,E]\nedge_attr tensor [E,2]]
+  J -->|No| K[edge_index empty and no edge_attr]
+  J -->|Yes| L[edge_index tensor 2 by E\nedge_attr tensor E by 2]
 
   K --> M[return edge_index, edge_attr]
   L --> M
 ```
 
-## 11. Reward Computation Flow
+## 13. Reward Computation Flow
 
 ```mermaid
 flowchart TD
-  A[TrafficSignalEnv._compute_rewards()] --> B{for each tl_id}
+  A[Compute rewards in env] --> B{for each tl_id}
   B --> C[Read lane metrics from TraCIAdapter\nqueue, waiting, speed, occupancy]
   C --> D[Build IntersectionMetrics]
   D --> E[Append to metrics_list]
-  E --> F[RewardCalculator.compute_batch(metrics_list)]
+  E --> F[Batch reward aggregation]
 
   F --> G{mode}
-  G -->|queue| H[reward = -sum(queue_lengths)]
-  G -->|wait| I[reward = -sum(waiting_times)]
-  G -->|pressure| J[reward = -sum(queue_lengths) proxy]
-  G -->|combined| K[weighted queue + wait + speed + throughput]
+  G -->|queue| H[queue penalty reward]
+  G -->|wait| I[waiting time penalty reward]
+  G -->|pressure| J[pressure proxy reward]
+  G -->|combined| K[weighted combined reward]
 
-  H --> Z[Tensor[n_agents]]
+  H --> Z[Tensor of n_agents]
   I --> Z
   J --> Z
   K --> Z
 ```
 
-## 12. Environment Lifecycle States
+## 14. Environment Lifecycle States
 
 ```mermaid
 stateDiagram-v2
