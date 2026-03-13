@@ -1,0 +1,56 @@
+env:
+  net_file: nets/grid5x5/grid5x5.net.xml
+  route_file: nets/grid5x5/grid5x5.rou.xml
+  delta_t: 5
+  begin_time: 0
+  end_time: 3600
+  sumo_binary: sumo
+  gui: false
+  additional_files: null
+  reward_mode: combined
+  reward_weights:
+    queue: -0.25
+    wait: -0.25
+    speed: 0.25
+    throughput: 0.25
+  yellow_duration: 3
+  all_red_duration: 1
+  min_green_duration: 5
+
+model:
+  encoder_cfg:
+    hidden_dim: 128
+    out_dim: 64
+    heads: 4
+    edge_dim: 2
+    dropout: 0.0
+  actor_cfg:
+    hidden_dim: 128
+  critic_cfg:
+    hidden_dim: 256
+  init_alpha: 0.2
+  tau: 0.005
+
+train:
+  seed: 42
+  episodes: 300
+  lr: 3.0e-4
+  gamma: 0.99
+  batch_size: 64
+  replay_capacity: 50000
+  warmup: 500
+  updates_per_step: 1
+  log_interval: 10
+
+wandb:
+  enabled: true
+  project: marl-traffic-gat
+  run_name: null
+
+runtime:
+  out_dir: runs/gat_baseline
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

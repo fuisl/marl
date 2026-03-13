@@ -31,7 +31,6 @@ Outputs
 
 from __future__ import annotations
 
-import argparse
 import collections
 import csv
 import os
@@ -40,6 +39,9 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
+
+import hydra
+from omegaconf import DictConfig, OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -64,26 +66,6 @@ def _load_dotenv(path: Path) -> None:
         if key and key not in os.environ:
             os.environ[key] = value
 
-
-def _env_str(name: str, default: str | None) -> str | None:
-    return os.environ.get(name, default)
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.environ.get(name)
-    return int(value) if value not in (None, "") else default
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.environ.get(name)
-    return float(value) if value not in (None, "") else default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value in (None, ""):
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 try:
     import wandb
@@ -349,28 +331,39 @@ def sac_update(
 # ======================================================================
 
 
-def train(args: argparse.Namespace) -> None:
+def train(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[train_gat_baseline] device={device}")
-    print(f"  net:   {args.net}")
-    print(f"  route: {args.route}")
+    print(f"  net:   {cfg.env.net_file}")
+    print(f"  route: {cfg.env.route_file}")
 
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
+    torch.manual_seed(int(cfg.train.seed))
+    random.seed(int(cfg.train.seed))
+
+    out_dir = Path(str(cfg.runtime.out_dir))
+    if not out_dir.is_absolute():
+        out_dir = REPO_ROOT / out_dir
+    additional_files = (
+        None
+        if cfg.env.additional_files is None
+        else OmegaConf.to_container(cfg.env.additional_files, resolve=True)
+    )
 
     # --- Environment (real SUMO via libsumo) ---
     env = TrafficSignalEnv(
-        net_file=args.net,
-        route_file=args.route,
-        delta_t=args.delta_t,
-        min_green_duration=args.min_green,
-        yellow_duration=args.yellow_duration,
-        all_red_duration=args.all_red_duration,
-        reward_mode=args.reward_mode,
-        begin_time=0,
-        end_time=args.end_time,
-        sumo_binary="sumo",
-        gui=False,
+        net_file=cfg.env.net_file,
+        route_file=cfg.env.route_file,
+        delta_t=int(cfg.env.delta_t),
+        reward_mode=cfg.env.reward_mode,
+        reward_weights=OmegaConf.to_container(cfg.env.reward_weights, resolve=True),
+        yellow_duration=int(cfg.env.yellow_duration),
+        all_red_duration=int(cfg.env.all_red_duration),
+        min_green_duration=int(cfg.env.min_green_duration),
+        sumo_binary=cfg.env.sumo_binary,
+        gui=bool(cfg.env.gui),
+        begin_time=int(cfg.env.begin_time),
+        end_time=int(cfg.env.end_time),
+        additional_files=additional_files,
     )
 
     td0 = env.reset()
@@ -384,15 +377,9 @@ def train(args: argparse.Namespace) -> None:
     )
 
     # --- Agent ---
-    encoder_cfg = {
-        "hidden_dim": args.hidden_dim,
-        "out_dim":    args.latent_dim,
-        "heads":      args.gat_heads,
-        "edge_dim":   2,          # [distance_m, n_lanes]
-        "dropout":    args.dropout,
-    }
-    actor_cfg  = {"hidden_dim": args.hidden_dim}
-    critic_cfg = {"hidden_dim": args.hidden_dim * 2}
+    encoder_cfg = OmegaConf.to_container(cfg.model.encoder_cfg, resolve=True)
+    actor_cfg = OmegaConf.to_container(cfg.model.actor_cfg, resolve=True)
+    critic_cfg = OmegaConf.to_container(cfg.model.critic_cfg, resolve=True)
 
     agent = MARLDiscreteSAC(
         obs_dim=obs_dim,
@@ -400,8 +387,8 @@ def train(args: argparse.Namespace) -> None:
         encoder_cfg=encoder_cfg,
         actor_cfg=actor_cfg,
         critic_cfg=critic_cfg,
-        init_alpha=args.init_alpha,
-        tau=args.tau,
+        init_alpha=float(cfg.model.init_alpha),
+        tau=float(cfg.model.tau),
     ).to(device)
 
     total_params = sum(p.numel() for p in agent.parameters())
@@ -410,35 +397,33 @@ def train(args: argparse.Namespace) -> None:
     # --- Optimizers ---
     opt_enc_actor = Adam(
         list(agent.encoder.parameters()) + list(agent.actor.parameters()),
-        lr=args.lr,
+        lr=float(cfg.train.lr),
     )
-    opt_critic = Adam(agent.critic.parameters(), lr=args.lr)
-    opt_alpha  = Adam([agent.log_alpha], lr=args.lr)
+    opt_critic = Adam(agent.critic.parameters(), lr=float(cfg.train.lr))
+    opt_alpha  = Adam([agent.log_alpha], lr=float(cfg.train.lr))
     optimizers = {"actor": opt_enc_actor, "critic": opt_critic, "alpha": opt_alpha}
 
     # --- Loss & Replay ---
-    loss_fn = DiscreteSACLossComputer(agent, gamma=args.gamma)
-    replay  = ReplayBuffer(args.replay_capacity, seed=args.seed)
+    loss_fn = DiscreteSACLossComputer(agent, gamma=float(cfg.train.gamma))
+    replay  = ReplayBuffer(int(cfg.train.replay_capacity), seed=int(cfg.train.seed))
 
     # --- W&B ---
-    use_wandb = _WANDB_AVAILABLE and not args.no_wandb
+    use_wandb = _WANDB_AVAILABLE and bool(cfg.wandb.enabled)
     if use_wandb:
-        # Resolve API key: CLI arg > WANDB_API_KEY env var > stored credentials
-        api_key = args.wandb_api_key or os.environ.get("WANDB_API_KEY")
+        api_key = os.environ.get("WANDB_API_KEY")
         if api_key:
             wandb.login(key=api_key, relogin=True)
         wandb.init(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),
-            dir=str(Path(args.out_dir)),
+            project=str(cfg.wandb.project),
+            name=cfg.wandb.run_name,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            dir=str(out_dir),
             tags=["gat", "discrete-sac", "marl", "sumo-5x5"],
         )
         wandb.define_metric("episode")
         wandb.define_metric("*", step_metric="episode")
 
     # --- Logging ---
-    out_dir  = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.csv"
     fieldnames = [
@@ -462,7 +447,7 @@ def train(args: argparse.Namespace) -> None:
           f"  {'ActorL':>9}  {'Entropy':>9}  {'Alpha':>7}  {'Trans':>7}")
     print("-" * 85)
 
-    for ep in range(1, args.episodes + 1):
+    for ep in range(1, int(cfg.train.episodes) + 1):
         agent.train()
         transitions, ep_return, ep_steps = run_episode(env, agent, device)
 
@@ -474,9 +459,9 @@ def train(args: argparse.Namespace) -> None:
         ma50 = sum(return_history) / len(return_history)
 
         # --- Gradient updates (one per new transition, after warmup) ---
-        if total_transitions >= args.warmup:
-            for _ in range(len(transitions) * args.updates_per_step):
-                m = sac_update(loss_fn, replay, optimizers, args.batch_size, device)
+        if total_transitions >= int(cfg.train.warmup):
+            for _ in range(len(transitions) * int(cfg.train.updates_per_step)):
+                m = sac_update(loss_fn, replay, optimizers, int(cfg.train.batch_size), device)
                 if m is not None:
                     last_metrics = m
             agent.soft_update_target()
@@ -520,12 +505,12 @@ def train(args: argparse.Namespace) -> None:
             }, step=ep)
 
         # --- Console ---
-        if ep % args.log_interval == 0 or ep == 1:
+        if ep % int(cfg.train.log_interval) == 0 or ep == 1:
             cl = last_metrics.get("critic_loss", float("nan"))
             al = last_metrics.get("actor_loss",  float("nan"))
             en = last_metrics.get("entropy",     float("nan"))
             a  = last_metrics.get("alpha",       float("nan"))
-            warm_tag = "" if total_transitions >= args.warmup else " [warmup]"
+            warm_tag = "" if total_transitions >= int(cfg.train.warmup) else " [warmup]"
             print(
                 f"{ep:6d}  {ep_return:10.2f}  {ma50:10.2f}"
                 f"  {cl:9.4f}  {al:9.4f}  {en:9.4f}  {a:7.4f}"
@@ -545,75 +530,10 @@ def train(args: argparse.Namespace) -> None:
     print(f"  log        → {log_path}")
 
 
-# ======================================================================
-# CLI
-# ======================================================================
-
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Train GAT-based MARL Discrete-SAC on a real SUMO 5×5 grid.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-
-    # Environment
-    p.add_argument("--net",   default=_env_str("MARL_NET", "nets/grid5x5/grid5x5.net.xml"),
-                   help="SUMO .net.xml file")
-    p.add_argument("--route", default=_env_str("MARL_ROUTE", "nets/grid5x5/grid5x5.rou.xml"),
-                   help="SUMO .rou.xml file")
-    p.add_argument("--end-time", type=int, default=_env_int("MARL_END_TIME", 3600),
-                   help="Simulation horizon (s)")
-    p.add_argument("--delta-t",  type=int, default=_env_int("MARL_DELTA_T", 5),
-                   help="RL decision interval (simulation seconds)")
-    p.add_argument("--min-green", type=int, default=_env_int("MARL_MIN_GREEN", 5),
-                   help="Minimum green hold time (simulation seconds)")
-    p.add_argument("--yellow-duration", type=int, default=_env_int("MARL_YELLOW_DURATION", 3))
-    p.add_argument("--all-red-duration", type=int, default=_env_int("MARL_ALL_RED_DURATION", 1))
-    p.add_argument("--reward-mode", default=_env_str("MARL_REWARD_MODE", "combined"),
-                   choices=["queue", "wait", "pressure", "combined"])
-
-    # Model
-    p.add_argument("--hidden-dim", type=int, default=_env_int("MARL_HIDDEN_DIM", 128),
-                   help="Hidden dimension for GATv2 and MLP heads")
-    p.add_argument("--latent-dim", type=int, default=_env_int("MARL_LATENT_DIM", 64),
-                   help="Encoder output dimension")
-    p.add_argument("--gat-heads", type=int, default=_env_int("MARL_GAT_HEADS", 4),
-                   help="Number of GAT attention heads")
-    p.add_argument("--dropout", type=float, default=_env_float("MARL_DROPOUT", 0.0))
-    p.add_argument("--init-alpha", type=float, default=_env_float("MARL_INIT_ALPHA", 0.2),
-                   help="Initial entropy temperature")
-    p.add_argument("--tau", type=float, default=_env_float("MARL_TAU", 0.005),
-                   help="Target network EMA coefficient")
-
-    # Training
-    p.add_argument("--episodes", type=int, default=_env_int("MARL_EPISODES", 300))
-    p.add_argument("--lr", type=float, default=_env_float("MARL_LR", 3e-4))
-    p.add_argument("--gamma", type=float, default=_env_float("MARL_GAMMA", 0.99))
-    p.add_argument("--batch-size", type=int, default=_env_int("MARL_BATCH_SIZE", 64))
-    p.add_argument("--replay-capacity", type=int, default=_env_int("MARL_REPLAY_CAPACITY", 50_000))
-    p.add_argument("--warmup", type=int, default=_env_int("MARL_WARMUP", 500),
-                   help="Transitions before first gradient update")
-    p.add_argument("--updates-per-step", type=int, default=_env_int("MARL_UPDATES_PER_STEP", 1),
-                   help="Gradient updates per collected transition")
-
-    # Misc
-    p.add_argument("--log-interval", type=int, default=_env_int("MARL_LOG_INTERVAL", 10))
-    p.add_argument("--seed", type=int, default=_env_int("MARL_SEED", 42))
-    p.add_argument("--out-dir", default=_env_str("MARL_OUT_DIR", "runs/gat_baseline"))
-
-    # W&B
-    p.add_argument("--no-wandb", action="store_true", default=_env_bool("MARL_NO_WANDB", False),
-                   help="Disable Weights & Biases logging")
-    p.add_argument("--wandb-project", default=_env_str("WANDB_PROJECT", "marl-traffic-gat"),
-                   help="W&B project name")
-    p.add_argument("--wandb-run-name", default=_env_str("WANDB_RUN_NAME", None),
-                   help="W&B run display name (auto-generated if omitted)")
-    p.add_argument("--wandb-api-key", default=_env_str("WANDB_API_KEY", None),
-                   help="W&B API key (overrides WANDB_API_KEY env var; "
-                        "skips interactive login)")
-
-    return p.parse_args()
+@hydra.main(version_base=None, config_path="../configs", config_name="gat_baseline")
+def main(cfg: DictConfig) -> None:
+    train(cfg)
 
 
 if __name__ == "__main__":
-    train(_parse_args())
+    main()
