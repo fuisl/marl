@@ -4,7 +4,10 @@ Wires together configs, Lightning module, and Trainer.
 
 Usage::
 
-    python -m train.train --config configs/train.yaml
+    python -m train.train
+
+    # Override keys at the command line (Hydra syntax):
+    python -m train.train train.max_epochs=50 wandb.enabled=true
 """
 
 from __future__ import annotations

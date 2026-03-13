@@ -2,7 +2,7 @@
 
 Usage::
 
-    python -m train.evaluate --checkpoint path/to/checkpoint.ckpt --config configs/train.yaml
+    python -m train.evaluate runtime.checkpoint_path=runs/lightning_train/checkpoints/last.ckpt
 """
 
 from __future__ import annotations

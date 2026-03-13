@@ -5,7 +5,10 @@ so you have a fair comparison baseline.
 
 Usage::
 
-    python scripts/run_sumo_baseline.py --config configs/env.yaml
+    python scripts/run_sumo_baseline.py
+
+    # Override any env key at the command line:
+    python scripts/run_sumo_baseline.py env.end_time=1800 env.gui=true
 """
 
 from __future__ import annotations
