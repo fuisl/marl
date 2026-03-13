@@ -10,11 +10,20 @@ Usage::
 
 from __future__ import annotations
 
-import argparse
+import sys
+from pathlib import Path
 
-import yaml
+import hydra
+from omegaconf import DictConfig
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from config_utils import load_dotenv, maybe_to_container
 
 from marl_env.sumo_env import TrafficSignalEnv
+
+load_dotenv()
 
 
 def run_baseline(env_cfg: dict) -> dict[str, float]:
@@ -60,14 +69,9 @@ def run_baseline(env_cfg: dict) -> dict[str, float]:
     return metrics
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Run SUMO fixed-time baseline.")
-    parser.add_argument("--config", type=str, default="configs/env.yaml")
-    args = parser.parse_args()
-
-    with open(args.config) as f:
-        env_cfg = yaml.safe_load(f)
-
+@hydra.main(version_base=None, config_path="../configs", config_name="sumo_baseline")
+def main(cfg: DictConfig) -> None:
+    env_cfg = maybe_to_container(cfg.env)
     run_baseline(env_cfg)
 
 

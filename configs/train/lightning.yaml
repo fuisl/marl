@@ -1,0 +1,18 @@
+seed: 42
+
+lr_actor: 3.0e-4
+lr_critic: 3.0e-4
+lr_alpha: 3.0e-4
+
+gamma: 0.99
+
+replay_capacity: 100000
+batch_size: 256
+
+max_epochs: 200
+steps_per_epoch: 100
+warmup_steps: 1000
+updates_per_step: 1
+target_update_freq: 1
+
+eval_interval: 10

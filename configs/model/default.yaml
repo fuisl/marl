@@ -1,0 +1,15 @@
+encoder_cfg:
+  hidden_dim: 128
+  out_dim: 64
+  heads: 4
+  edge_dim: 2
+  dropout: 0.0
+
+actor_cfg:
+  hidden_dim: 128
+
+critic_cfg:
+  hidden_dim: 256
+
+init_alpha: 0.2
+tau: 0.005

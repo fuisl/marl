@@ -7,16 +7,19 @@ Usage::
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
+import hydra
 import torch
-import yaml
+from omegaconf import DictConfig, OmegaConf
 
+from config_utils import load_dotenv, resolve_repo_path
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 from rl.rollout import RolloutWorker
 from train.lightning_module import TrafficMARLModule
+
+load_dotenv()
 
 
 def evaluate(
@@ -68,25 +71,19 @@ def evaluate(
     return all_metrics
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate a trained MARL agent.")
-    parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--config", type=str, default="configs/train.yaml")
-    parser.add_argument("--episodes", type=int, default=5)
-    parser.add_argument("--device", type=str, default="cpu")
-    parser.add_argument("--gui", action="store_true")
-    args = parser.parse_args()
-
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+@hydra.main(version_base=None, config_path="../configs", config_name="evaluate")
+def main(cfg: DictConfig) -> None:
+    checkpoint_path = cfg.runtime.checkpoint_path
+    if checkpoint_path in (None, ""):
+        raise ValueError("Set runtime.checkpoint_path in config or via Hydra override.")
 
     evaluate(
-        checkpoint_path=args.checkpoint,
-        env_cfg=cfg.get("env", {}),
-        model_cfg=cfg.get("model", {}),
-        n_episodes=args.episodes,
-        device=args.device,
-        gui=args.gui,
+        checkpoint_path=str(resolve_repo_path(checkpoint_path)),
+        env_cfg=OmegaConf.to_container(cfg.env, resolve=True),
+        model_cfg=OmegaConf.to_container(cfg.model, resolve=True),
+        n_episodes=int(cfg.runtime.episodes),
+        device=str(cfg.runtime.device),
+        gui=bool(cfg.runtime.gui),
     )
 
 

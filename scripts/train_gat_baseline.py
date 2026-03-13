@@ -44,27 +44,9 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
-
-def _load_dotenv(path: Path) -> None:
-    """Load simple KEY=VALUE pairs from ``path`` into ``os.environ``."""
-    if not path.exists():
-        return
-
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if "=" not in line:
-            continue
-
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+from config_utils import load_dotenv, maybe_to_container, resolve_repo_path
 
 
 try:
@@ -73,7 +55,7 @@ try:
 except ImportError:
     _WANDB_AVAILABLE = False
 
-_load_dotenv(REPO_ROOT / ".env")
+load_dotenv()
 
 # Must be set BEFORE importing marl_env so TraCIAdapter picks up libsumo.
 os.environ.setdefault("LIBSUMO_AS_TRACI", "1")
@@ -82,11 +64,6 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 from torch.optim import Adam
-
-# ---------------------------------------------------------------------------
-# Allow running as a top-level script from the project root
-# ---------------------------------------------------------------------------
-sys.path.insert(0, str(REPO_ROOT))
 
 from marl_env.sumo_env import TrafficSignalEnv  # noqa: E402
 from models.marl_discrete_sac import MARLDiscreteSAC  # noqa: E402
@@ -340,14 +317,8 @@ def train(cfg: DictConfig) -> None:
     torch.manual_seed(int(cfg.train.seed))
     random.seed(int(cfg.train.seed))
 
-    out_dir = Path(str(cfg.runtime.out_dir))
-    if not out_dir.is_absolute():
-        out_dir = REPO_ROOT / out_dir
-    additional_files = (
-        None
-        if cfg.env.additional_files is None
-        else OmegaConf.to_container(cfg.env.additional_files, resolve=True)
-    )
+    out_dir = resolve_repo_path(cfg.runtime.out_dir)
+    additional_files = maybe_to_container(cfg.env.additional_files)
 
     # --- Environment (real SUMO via libsumo) ---
     env = TrafficSignalEnv(
@@ -355,7 +326,7 @@ def train(cfg: DictConfig) -> None:
         route_file=cfg.env.route_file,
         delta_t=int(cfg.env.delta_t),
         reward_mode=cfg.env.reward_mode,
-        reward_weights=OmegaConf.to_container(cfg.env.reward_weights, resolve=True),
+        reward_weights=maybe_to_container(cfg.env.reward_weights),
         yellow_duration=int(cfg.env.yellow_duration),
         all_red_duration=int(cfg.env.all_red_duration),
         min_green_duration=int(cfg.env.min_green_duration),
@@ -377,9 +348,9 @@ def train(cfg: DictConfig) -> None:
     )
 
     # --- Agent ---
-    encoder_cfg = OmegaConf.to_container(cfg.model.encoder_cfg, resolve=True)
-    actor_cfg = OmegaConf.to_container(cfg.model.actor_cfg, resolve=True)
-    critic_cfg = OmegaConf.to_container(cfg.model.critic_cfg, resolve=True)
+    encoder_cfg = maybe_to_container(cfg.model.encoder_cfg)
+    actor_cfg = maybe_to_container(cfg.model.actor_cfg)
+    critic_cfg = maybe_to_container(cfg.model.critic_cfg)
 
     agent = MARLDiscreteSAC(
         obs_dim=obs_dim,
@@ -410,9 +381,6 @@ def train(cfg: DictConfig) -> None:
     # --- W&B ---
     use_wandb = _WANDB_AVAILABLE and bool(cfg.wandb.enabled)
     if use_wandb:
-        api_key = os.environ.get("WANDB_API_KEY")
-        if api_key:
-            wandb.login(key=api_key, relogin=True)
         wandb.init(
             project=str(cfg.wandb.project),
             name=cfg.wandb.run_name,
