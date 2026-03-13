@@ -27,17 +27,29 @@ class FakeTraCIAdapter:
         }
         self.phases = {tl_id: 0 for tl_id in self.tl_ids}
         self.phase_history = {tl_id: [0] for tl_id in self.tl_ids}
+        self._phase_durations = {0: 999, 1: 1, 2: 1, 3: 999, 4: 1, 5: 1}
+        self._remaining = {tl_id: self._phase_durations[0] for tl_id in self.tl_ids}
 
     def start(self) -> None:
         self.time = 0
         self.phases = {tl_id: 0 for tl_id in self.tl_ids}
         self.phase_history = {tl_id: [0] for tl_id in self.tl_ids}
+        self._remaining = {tl_id: self._phase_durations[0] for tl_id in self.tl_ids}
 
     def close(self, wait: bool = False) -> None:
         _ = wait
 
     def simulation_step(self) -> None:
         self.time += 1
+        for tl_id in self.tl_ids:
+            self._remaining[tl_id] -= 1
+            if self._remaining[tl_id] > 0:
+                continue
+
+            nxt = (self.phases[tl_id] + 1) % 6
+            self.phases[tl_id] = nxt
+            self.phase_history[tl_id].append(nxt)
+            self._remaining[tl_id] = self._phase_durations[nxt]
 
     @property
     def min_expected_vehicles(self) -> int:
@@ -60,6 +72,7 @@ class FakeTraCIAdapter:
     def set_phase(self, tl_id: str, phase_index: int) -> None:
         self.phases[tl_id] = phase_index
         self.phase_history[tl_id].append(phase_index)
+        self._remaining[tl_id] = self._phase_durations[phase_index]
 
     def get_program_logic(self, tl_id: str) -> list[FakeLogic]:
         _ = tl_id
@@ -189,8 +202,10 @@ def test_transition_sequence_and_elapsed_reset(monkeypatch: object) -> None:
     assert env._current_green["J1"] == 0
 
     switch_actions = torch.tensor([1, 1], dtype=torch.long)
+    elapsed_trace: list[float] = []
     for _ in range(4):
         env.step(switch_actions)
+        elapsed_trace.append(env._elapsed_green["J1"])
 
     history = env.adapter.phase_history["J1"]
     assert 1 in history  # yellow phase
@@ -198,5 +213,7 @@ def test_transition_sequence_and_elapsed_reset(monkeypatch: object) -> None:
     assert history[-1] == 3  # destination green
 
     assert env._current_green["J1"] == 3
-    assert env._elapsed_green["J1"] == 0.0
+    # Under SUMO-managed progression, elapsed green resets at arrival to
+    # destination green and may increase on subsequent steps.
+    assert 0.0 in elapsed_trace
     assert not env.constraints.in_transition("J1")

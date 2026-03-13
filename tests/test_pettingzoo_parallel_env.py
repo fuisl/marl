@@ -31,16 +31,27 @@ class FakeTraCIAdapter:
             "J2": ["j2_l1", "j2_l2"],
         }
         self.phases = {tl_id: 0 for tl_id in self.tl_ids}
+        self._phase_durations = {0: 999, 1: 1, 2: 1, 3: 999, 4: 1, 5: 1}
+        self._remaining = {tl_id: self._phase_durations[0] for tl_id in self.tl_ids}
 
     def start(self) -> None:
         self.time = 0
         self.phases = {tl_id: 0 for tl_id in self.tl_ids}
+        self._remaining = {tl_id: self._phase_durations[0] for tl_id in self.tl_ids}
 
     def close(self, wait: bool = False) -> None:
         _ = wait
 
     def simulation_step(self) -> None:
         self.time += 1
+        for tl_id in self.tl_ids:
+            self._remaining[tl_id] -= 1
+            if self._remaining[tl_id] > 0:
+                continue
+
+            nxt = (self.phases[tl_id] + 1) % 6
+            self.phases[tl_id] = nxt
+            self._remaining[tl_id] = self._phase_durations[nxt]
 
     @property
     def min_expected_vehicles(self) -> int:
@@ -62,6 +73,7 @@ class FakeTraCIAdapter:
 
     def set_phase(self, tl_id: str, phase_index: int) -> None:
         self.phases[tl_id] = phase_index
+        self._remaining[tl_id] = self._phase_durations[phase_index]
 
     def get_program_logic(self, tl_id: str) -> list[FakeLogic]:
         _ = tl_id
