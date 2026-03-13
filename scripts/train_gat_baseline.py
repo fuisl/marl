@@ -14,13 +14,12 @@ Requirements
 
 Usage
 -----
-    # Default: 5×5 grid, configs/env.yaml + configs/model.yaml
+    # Default: 5×5 grid, configs/gat_baseline.yaml
     python scripts/train_gat_baseline.py
 
-    # Custom settings
-    python scripts/train_gat_baseline.py --episodes 200 --batch-size 128 \\
-        --net nets/grid5x5/grid5x5.net.xml \\
-        --route nets/grid5x5/grid5x5.rou.xml
+    # Override keys at the command line (Hydra syntax):
+    python scripts/train_gat_baseline.py train.episodes=200 train.batch_size=128 \\
+        train.optimizer.name=adam wandb.enabled=true
 
 Outputs
 -------
@@ -63,11 +62,11 @@ os.environ.setdefault("LIBSUMO_AS_TRACI", "1")
 import torch
 from tensordict import TensorDict
 from torch import Tensor
-from torch.optim import Adam
 
 from marl_env.sumo_env import TrafficSignalEnv  # noqa: E402
 from models.marl_discrete_sac import MARLDiscreteSAC  # noqa: E402
 from rl.losses import DiscreteSACLossComputer  # noqa: E402
+from rl.optimizers import make_optimizer  # noqa: E402
 
 
 # ======================================================================
@@ -366,12 +365,13 @@ def train(cfg: DictConfig) -> None:
     print(f"  agent params: {total_params:,}")
 
     # --- Optimizers ---
-    opt_enc_actor = Adam(
+    optim_cfg = maybe_to_container(cfg.train.optimizer)
+    opt_enc_actor = make_optimizer(
         list(agent.encoder.parameters()) + list(agent.actor.parameters()),
-        lr=float(cfg.train.lr),
+        optim_cfg,
     )
-    opt_critic = Adam(agent.critic.parameters(), lr=float(cfg.train.lr))
-    opt_alpha  = Adam([agent.log_alpha], lr=float(cfg.train.lr))
+    opt_critic = make_optimizer(agent.critic.parameters(), optim_cfg)
+    opt_alpha  = make_optimizer([agent.log_alpha], optim_cfg)
     optimizers = {"actor": opt_enc_actor, "critic": opt_critic, "alpha": opt_alpha}
 
     # --- Loss & Replay ---
