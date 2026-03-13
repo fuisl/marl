@@ -90,8 +90,11 @@ class TraCIAdapter:
             return
 
         try:
-            # Both traci and libsumo expose close(); traci docs also allow close(False).
-            self._conn.close(wait)
+            # libsumo's close() takes no arguments; traci's accepts close(False).
+            try:
+                self._conn.close(wait)
+            except TypeError:
+                self._conn.close()
         finally:
             self._conn = None
 
