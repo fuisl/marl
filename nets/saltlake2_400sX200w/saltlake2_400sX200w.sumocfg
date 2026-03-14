@@ -1,0 +1,8 @@
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/neteditConfiguration.xsd">
+
+    <input>
+        <route-files value="saltlake2_400sX200w.flo.xml" />
+        <net-file value="saltlake2_400sX200w.net.xml" />
+    </input>
+
+</configuration>
