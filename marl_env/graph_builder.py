@@ -34,6 +34,8 @@ class GraphBuilder:
         self.net: Any = sumolib.net.readNet(net_file, withInternal=False)
         self.tl_ids = tl_ids
         self._id_to_idx = {tl_id: i for i, tl_id in enumerate(tl_ids)}
+        self._tls_nodes_by_id = self._build_tls_node_map()
+        self._node_to_tls_id = self._build_node_to_tls_map(self._tls_nodes_by_id)
 
         self._edge_index: Tensor | None = None
         self._edge_attr: Tensor | None = None
@@ -51,13 +53,9 @@ class GraphBuilder:
         dst_list: list[int] = []
         attrs: list[list[float]] = []
 
-        tl_nodes = {
-            tl_id: self.net.getNode(tl_id) for tl_id in self.tl_ids
-        }
-
-        for tl_id, node in tl_nodes.items():
+        for tl_id in self.tl_ids:
             src_idx = self._id_to_idx[tl_id]
-            neighbors = self._get_neighbor_tl_ids(node)
+            neighbors = self._get_neighbor_tl_ids_for_tls(tl_id)
 
             for nbr_id, dist, n_lanes in neighbors:
                 if nbr_id not in self._id_to_idx:
@@ -136,3 +134,81 @@ class GraphBuilder:
             neighbors.append((nbr_id, dist, n_lanes))
 
         return neighbors
+
+    def _get_neighbor_tl_ids_for_tls(self, tl_id: str) -> list[tuple[str, float, int]]:
+        """Return ``(neighbor_tl_id, distance, n_lanes)`` for a TLS controller.
+
+        In some SUMO maps (for example Berlin), traffic-light IDs returned by
+        TraCI are controller IDs that do not match a node ID. For those maps we
+        derive neighbours from nodes controlled by each TLS.
+        """
+        controlled_nodes = self._tls_nodes_by_id.get(tl_id)
+        if controlled_nodes:
+            neighbors: list[tuple[str, float, int]] = []
+            seen: set[str] = set()
+            for node in controlled_nodes:
+                for edge in node.getOutgoing():
+                    to_node = edge.getToNode()
+                    nbr_id = self._node_to_tls_id.get(to_node.getID())
+                    if nbr_id is None or nbr_id == tl_id or nbr_id in seen:
+                        continue
+                    if nbr_id not in self._id_to_idx:
+                        continue
+                    seen.add(nbr_id)
+                    neighbors.append((nbr_id, edge.getLength(), edge.getLaneNumber()))
+
+                for edge in node.getIncoming():
+                    from_node = edge.getFromNode()
+                    nbr_id = self._node_to_tls_id.get(from_node.getID())
+                    if nbr_id is None or nbr_id == tl_id or nbr_id in seen:
+                        continue
+                    if nbr_id not in self._id_to_idx:
+                        continue
+                    seen.add(nbr_id)
+                    neighbors.append((nbr_id, edge.getLength(), edge.getLaneNumber()))
+            return neighbors
+
+        # Fallback for scenarios where TLS IDs equal node IDs.
+        try:
+            node = self.net.getNode(tl_id)
+        except KeyError:
+            return []
+        return self._get_neighbor_tl_ids(node)
+
+    def _build_tls_node_map(self) -> dict[str, list[Any]]:
+        """Map TLS/controller ID -> list of controlled SUMO nodes."""
+        if not hasattr(self.net, "getTrafficLights"):
+            return {}
+
+        tls_nodes_by_id: dict[str, list[Any]] = {}
+        for tls in self.net.getTrafficLights():
+            tls_id = tls.getID()
+            nodes_by_id: dict[str, Any] = {}
+
+            # sumolib stores TLS links as [fromLane, toLane, tlLinkIndex]
+            for conn in tls.getConnections():
+                if len(conn) < 2:
+                    continue
+                from_lane = conn[0]
+                to_lane = conn[1]
+                for node in (
+                    from_lane.getEdge().getToNode(),
+                    to_lane.getEdge().getFromNode(),
+                ):
+                    nodes_by_id[node.getID()] = node
+
+            if nodes_by_id:
+                tls_nodes_by_id[tls_id] = list(nodes_by_id.values())
+
+        return tls_nodes_by_id
+
+    @staticmethod
+    def _build_node_to_tls_map(tls_nodes_by_id: dict[str, list[Any]]) -> dict[str, str]:
+        """Map SUMO node ID -> TLS/controller ID (first assignment wins)."""
+        node_to_tls_id: dict[str, str] = {}
+        for tls_id, nodes in tls_nodes_by_id.items():
+            for node in nodes:
+                node_id = node.getID()
+                if node_id not in node_to_tls_id:
+                    node_to_tls_id[node_id] = tls_id
+        return node_to_tls_id
