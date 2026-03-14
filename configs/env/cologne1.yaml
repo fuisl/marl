@@ -9,6 +9,7 @@ end_time: 28800
 sumo_binary: sumo
 gui: false
 additional_files: null
+graph_builder_mode: original
 
 reward_mode: pressure_queue
 reward_weights:

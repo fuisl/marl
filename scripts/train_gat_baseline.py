@@ -144,9 +144,16 @@ def pack_transition(
                         },
                         batch_size=[n],
                     ),
+                    "graph_observation": next_td.get(
+                        "graph_observation",
+                        next_td["agents", "observation"],
+                    ),
                 },
                 batch_size=[],
             ),
+            "graph_observation": td.get("graph_observation", td["agents", "observation"]),
+            "agent_node_indices": td["agent_node_indices"],
+            "agent_node_mask": td["agent_node_mask"],
             "edge_index": td["edge_index"],
         },
         batch_size=[],
@@ -172,11 +179,15 @@ def collate_batch(transitions: list[TensorDict]) -> TensorDict:
     n_obs   = torch.stack([t["next", "agents", "observation"]  for t in transitions])
     n_masks = torch.stack([t["next", "agents", "action_mask"]  for t in transitions])
     n_dones = torch.stack([t["next", "agents", "done"]         for t in transitions])
+    graph_obs = torch.stack([t["graph_observation"] for t in transitions])
+    next_graph_obs = torch.stack([t["next", "graph_observation"] for t in transitions])
 
     B, N = obs.shape[:2]
     # Topology is fixed: take from the first sample and store without batch dim.
     edge_index = transitions[0]["edge_index"]   # [2, E]
     edge_attr  = transitions[0].get("edge_attr", None)  # [E, 2] or None
+    agent_node_indices = transitions[0]["agent_node_indices"]
+    agent_node_mask = transitions[0]["agent_node_mask"]
 
     agents_td = TensorDict(
         {"observation": obs, "action": acts, "action_mask": masks,
@@ -192,7 +203,16 @@ def collate_batch(transitions: list[TensorDict]) -> TensorDict:
     batch = TensorDict(
         {
             "agents": agents_td,
-            "next": TensorDict({"agents": next_agents_td}, batch_size=[]),
+            "next": TensorDict(
+                {
+                    "agents": next_agents_td,
+                    "graph_observation": next_graph_obs,
+                },
+                batch_size=[],
+            ),
+            "graph_observation": graph_obs,
+            "agent_node_indices": agent_node_indices,
+            "agent_node_mask": agent_node_mask,
             "edge_index": edge_index,
         },
         batch_size=[],
@@ -249,12 +269,22 @@ def run_episode(
     n_decisions = 0
 
     while True:
-        obs = td["agents", "observation"]
+        obs = td.get("graph_observation", td["agents", "observation"])
         edge_index = td["edge_index"]
         edge_attr = td.get("edge_attr", None)
         mask = td["agents", "action_mask"]
+        agent_node_indices = td["agent_node_indices"]
+        agent_node_mask = td["agent_node_mask"]
 
-        actions, _ = agent.select_action(obs, edge_index, edge_attr, mask, deterministic)
+        actions, _ = agent.select_action(
+            obs,
+            edge_index,
+            edge_attr,
+            mask,
+            deterministic,
+            agent_node_indices=agent_node_indices,
+            agent_node_mask=agent_node_mask,
+        )
 
         next_td = env.step(actions.cpu()).to(device)
         transitions.append(pack_transition(td.cpu(), actions.cpu(), next_td.cpu()))
@@ -374,10 +404,11 @@ def train(cfg: DictConfig) -> None:
         begin_time=int(cfg.env.begin_time),
         end_time=int(cfg.env.end_time),
         additional_files=additional_files,
+        graph_builder_mode=str(getattr(cfg.env, "graph_builder_mode", "original")),
     )
 
     td0 = env.reset()
-    obs_dim     = int(td0["agents", "observation"].shape[-1])
+    obs_dim     = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
     num_actions = env.num_actions
     n_agents    = env.n_agents
     n_edges     = int(td0["edge_index"].shape[1])

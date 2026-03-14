@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 
 def _import_parallel_env_or_skip():
@@ -163,16 +164,28 @@ class FakeTraCIAdapterHeteroActions(FakeTraCIAdapter):
 
 
 class FakeGraphBuilder:
-    def __init__(self, net_file: str, tl_ids: list[str]) -> None:
+    def __init__(
+        self,
+        net_file: str,
+        tl_ids: list[str],
+        *,
+        mode: str = "original",
+    ) -> None:
         self.net_file = net_file
         self.tl_ids = tl_ids
+        self.mode = mode
+        self.node_ids = list(tl_ids)
+        self.agent_node_indices = torch.tensor([[0], [1]], dtype=torch.long)
+        self.agent_node_mask = torch.tensor([[True], [True]], dtype=torch.bool)
 
     def build(self):
-        import torch
-
         edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         edge_attr = torch.tensor([[10.0, 1.0], [10.0, 1.0]], dtype=torch.float32)
         return edge_index, edge_attr
+
+    @property
+    def attached_rl_ids_by_node(self) -> list[tuple[str, ...]]:
+        return [(tl_id,) for tl_id in self.tl_ids]
 
 
 def _make_env(monkeypatch: object, done_after: int = 20):

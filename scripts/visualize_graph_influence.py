@@ -23,8 +23,8 @@ os.environ.setdefault("LIBSUMO_AS_TRACI", "1")
 from visualization.graph_influence import run_visualization  # noqa: E402
 
 
-def _default_out_dir(checkpoint_path: Path, env_name: str) -> Path:
-    return checkpoint_path.parent / "visualizations" / env_name
+def _default_out_dir(checkpoint_path: Path, env_name: str, method_name: str) -> Path:
+    return checkpoint_path.parent / "visualizations" / env_name / method_name
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="visualize")
@@ -35,10 +35,11 @@ def main(cfg: DictConfig) -> None:
 
     checkpoint_path = resolve_repo_path(checkpoint_raw)
     env_name = Path(str(cfg.env.net_file)).stem
+    method_name = str(getattr(cfg.env, "graph_builder_mode", "original"))
 
     out_dir_raw = cfg.runtime.out_dir
     if out_dir_raw in (None, ""):
-        out_dir = _default_out_dir(checkpoint_path, env_name)
+        out_dir = _default_out_dir(checkpoint_path, env_name, method_name)
     else:
         out_dir = resolve_repo_path(out_dir_raw)
 

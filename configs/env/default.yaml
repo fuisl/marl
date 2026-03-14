@@ -19,6 +19,12 @@ gui: false
 # Additional SUMO input files (e.g. detector definitions)
 additional_files: null
 
+# Graph construction mode:
+#   - original: immediate TLS-to-TLS adjacency only
+#   - walk_to_light: contract through unsignalized nodes until next TLS
+#   - all_intersections: every SUMO intersection becomes a graph node
+graph_builder_mode: original
+
 # Reward function
 reward_mode: pressure_queue
 reward_weights:

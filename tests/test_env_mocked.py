@@ -143,14 +143,28 @@ class FakeTraCIAdapter:
 
 
 class FakeGraphBuilder:
-    def __init__(self, net_file: str, tl_ids: list[str]) -> None:
+    def __init__(
+        self,
+        net_file: str,
+        tl_ids: list[str],
+        *,
+        mode: str = "original",
+    ) -> None:
         self.net_file = net_file
         self.tl_ids = tl_ids
+        self.mode = mode
+        self.node_ids = list(tl_ids)
+        self.agent_node_indices = torch.tensor([[0], [1]], dtype=torch.long)
+        self.agent_node_mask = torch.tensor([[True], [True]], dtype=torch.bool)
 
     def build(self) -> tuple[torch.Tensor, torch.Tensor]:
         edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         edge_attr = torch.tensor([[10.0, 1.0], [10.0, 1.0]], dtype=torch.float32)
         return edge_index, edge_attr
+
+    @property
+    def attached_rl_ids_by_node(self) -> list[tuple[str, ...]]:
+        return [(tl_id,) for tl_id in self.tl_ids]
 
 
 def _sample_valid_actions(mask: torch.Tensor) -> torch.Tensor:
@@ -185,12 +199,16 @@ def test_env_reset_and_step_shapes_and_finite(monkeypatch: object) -> None:
     obs = td["agents", "observation"]
     mask = td["agents", "action_mask"]
     edge_index = td["edge_index"]
+    graph_obs = td["graph_observation"]
 
     assert obs.ndim == 2
     assert mask.ndim == 2
     assert obs.shape[0] == env.n_agents
     assert mask.shape[0] == env.n_agents
     assert edge_index.shape[0] == 2
+    assert graph_obs.shape == obs.shape
+    assert td["agent_node_indices"].shape == (env.n_agents, 1)
+    assert td["agent_node_mask"].shape == (env.n_agents, 1)
     assert torch.all(mask.any(dim=1))
 
     obs_shape = obs.shape

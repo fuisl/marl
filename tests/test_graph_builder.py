@@ -85,6 +85,9 @@ class FakeNet:
     def getTrafficLights(self) -> list[FakeTLS]:
         return self._tls_list
 
+    def getNodes(self) -> list[FakeNode]:
+        return list(self._nodes.values())
+
 
 class FakeNetNoTLSApi:
     def __init__(self, nodes: dict[str, FakeNode]) -> None:
@@ -92,6 +95,9 @@ class FakeNetNoTLSApi:
 
     def getNode(self, node_id: str) -> FakeNode:
         return self._nodes[node_id]
+
+    def getNodes(self) -> list[FakeNode]:
+        return list(self._nodes.values())
 
 
 @dataclass
@@ -153,18 +159,17 @@ def test_build_graph_from_berlin_style_tls_ids(monkeypatch: object) -> None:
     fake_net, tl_ids = _build_fake_graph(berlin_style_tls_ids=True)
     _patch_sumolib(monkeypatch, fake_net)
 
-    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=tl_ids)
+    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=tl_ids, mode="original")
     edge_index, edge_attr = builder.build()
 
     assert builder.num_nodes == 3
     assert edge_attr is not None
 
-    # Distances use the shortest undirected road segment between controllers.
     assert edge_index.tolist() == [[0, 1, 1, 2], [1, 0, 2, 1]]
     assert torch.allclose(
         edge_attr,
         torch.tensor(
-            [[10.0, 2.0], [10.0, 2.0], [20.0, 3.0], [20.0, 3.0]],
+            [[10.0, 2.0], [11.0, 1.0], [20.0, 3.0], [21.0, 1.0]],
             dtype=torch.float32,
         ),
     )
@@ -174,7 +179,7 @@ def test_build_graph_falls_back_to_node_ids_without_tls_api(monkeypatch: object)
     fake_net, tl_ids = _build_fake_graph(berlin_style_tls_ids=False)
     _patch_sumolib(monkeypatch, fake_net)
 
-    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=tl_ids)
+    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=tl_ids, mode="original")
     edge_index, edge_attr = builder.build()
 
     assert builder.num_nodes == 3
@@ -183,7 +188,7 @@ def test_build_graph_falls_back_to_node_ids_without_tls_api(monkeypatch: object)
     assert torch.allclose(
         edge_attr,
         torch.tensor(
-            [[10.0, 2.0], [10.0, 2.0], [20.0, 3.0], [20.0, 3.0]],
+            [[10.0, 2.0], [11.0, 1.0], [20.0, 3.0], [21.0, 1.0]],
             dtype=torch.float32,
         ),
     )
@@ -247,7 +252,11 @@ def test_build_graph_connects_tls_through_unsignalized_nodes(monkeypatch: object
     )
     _patch_sumolib(monkeypatch, fake_net)
 
-    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=["GS_A", "GS_B"])
+    builder = GraphBuilder(
+        net_file="unused.net.xml",
+        tl_ids=["GS_A", "GS_B"],
+        mode="walk_to_light",
+    )
     edge_index, edge_attr = builder.build()
 
     assert edge_attr is not None
@@ -256,6 +265,80 @@ def test_build_graph_connects_tls_through_unsignalized_nodes(monkeypatch: object
         edge_attr,
         torch.tensor(
             [[16.0, 1.0], [16.0, 1.0]],
+            dtype=torch.float32,
+        ),
+    )
+
+
+def test_original_mode_does_not_bridge_unsignalized_nodes(monkeypatch: object) -> None:
+    n_a = FakeNode("A", coord=(0.0, 0.0))
+    n_x = FakeNode("X", coord=(5.0, 0.0))
+    n_b = FakeNode("B", coord=(10.0, 0.0))
+
+    e_ax = _connect(n_a, n_x, 5.0, 3)
+    e_xa = _connect(n_x, n_a, 7.0, 2)
+    e_xb = _connect(n_x, n_b, 11.0, 1)
+    e_bx = _connect(n_b, n_x, 13.0, 4)
+
+    fake_net = FakeNet(
+        nodes={"A": n_a, "X": n_x, "B": n_b},
+        tls_list=[
+            FakeTLS("GS_A", [[FakeLane(e_xa), FakeLane(e_ax), 0]]),
+            FakeTLS("GS_B", [[FakeLane(e_xb), FakeLane(e_bx), 0]]),
+        ],
+    )
+    _patch_sumolib(monkeypatch, fake_net)
+
+    builder = GraphBuilder(
+        net_file="unused.net.xml",
+        tl_ids=["GS_A", "GS_B"],
+        mode="original",
+    )
+    edge_index, edge_attr = builder.build()
+
+    assert edge_index.shape == (2, 0)
+    assert edge_attr is None
+
+
+def test_all_intersections_mode_includes_unsignalized_nodes_and_agent_mapping(
+    monkeypatch: object,
+) -> None:
+    n_a = FakeNode("A", coord=(0.0, 0.0))
+    n_x = FakeNode("X", coord=(5.0, 0.0))
+    n_b = FakeNode("B", coord=(10.0, 0.0))
+
+    e_ax = _connect(n_a, n_x, 5.0, 3)
+    e_xa = _connect(n_x, n_a, 7.0, 2)
+    e_xb = _connect(n_x, n_b, 11.0, 1)
+    e_bx = _connect(n_b, n_x, 13.0, 4)
+
+    fake_net = FakeNet(
+        nodes={"A": n_a, "X": n_x, "B": n_b},
+        tls_list=[
+            FakeTLS("GS_A", [[FakeLane(e_xa), FakeLane(e_ax), 0]]),
+            FakeTLS("GS_B", [[FakeLane(e_xb), FakeLane(e_bx), 0]]),
+        ],
+    )
+    _patch_sumolib(monkeypatch, fake_net)
+
+    builder = GraphBuilder(
+        net_file="unused.net.xml",
+        tl_ids=["GS_A", "GS_B"],
+        mode="all_intersections",
+    )
+    edge_index, edge_attr = builder.build()
+
+    assert builder.node_ids == ["A", "X", "B"]
+    assert builder.num_nodes == 3
+    assert builder.agent_node_indices.tolist() == [[0], [2]]
+    assert builder.agent_node_mask.tolist() == [[True], [True]]
+    assert builder.attached_rl_ids_by_node == [("GS_A",), (), ("GS_B",)]
+    assert edge_attr is not None
+    assert edge_index.tolist() == [[0, 1, 1, 2], [1, 0, 2, 1]]
+    assert torch.allclose(
+        edge_attr,
+        torch.tensor(
+            [[5.0, 3.0], [7.0, 2.0], [11.0, 1.0], [13.0, 4.0]],
             dtype=torch.float32,
         ),
     )

@@ -95,7 +95,7 @@ class TrafficMARLModule(L.LightningModule):
         self.env = TrafficSignalEnv(**self._env_cfg)
         td = self.env.reset()
 
-        obs_dim = td["agents", "observation"].shape[-1]
+        obs_dim = td.get("graph_observation", td["agents", "observation"]).shape[-1]
         num_actions = self.env.num_actions
 
         # --- Agent ---

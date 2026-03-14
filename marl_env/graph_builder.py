@@ -7,7 +7,7 @@ Node features change every step; topology does not.
 from __future__ import annotations
 
 import heapq
-from typing import Any
+from typing import Any, Literal
 
 import torch
 from torch import Tensor
@@ -16,6 +16,18 @@ try:
     import sumolib  # type: ignore[import-untyped]
 except ImportError:
     sumolib = None  # allow import without sumolib for typing
+
+
+GraphConstructionMode = Literal[
+    "original",
+    "walk_to_light",
+    "all_intersections",
+]
+GRAPH_BUILDER_MODES: tuple[GraphConstructionMode, ...] = (
+    "original",
+    "walk_to_light",
+    "all_intersections",
+)
 
 
 class GraphBuilder:
@@ -30,19 +42,38 @@ class GraphBuilder:
     the number of connecting lanes.
     """
 
-    def __init__(self, net_file: str, tl_ids: list[str]) -> None:
+    def __init__(
+        self,
+        net_file: str,
+        tl_ids: list[str],
+        *,
+        mode: GraphConstructionMode = "original",
+    ) -> None:
         if sumolib is None:
             raise ImportError("sumolib is required — install SUMO tools.")
+        if mode not in GRAPH_BUILDER_MODES:
+            raise ValueError(
+                f"Unknown graph builder mode {mode!r}. Expected one of {GRAPH_BUILDER_MODES}."
+            )
 
         self.net: Any = sumolib.net.readNet(net_file, withInternal=False)
+        self.mode = mode
         self.tl_ids = tl_ids
         self._id_to_idx = {tl_id: i for i, tl_id in enumerate(tl_ids)}
         self._tls_nodes_by_id = self._build_tls_node_map()
         self._node_to_tls_id = self._build_node_to_tls_map(self._tls_nodes_by_id)
+        self._graph_node_ids = self._build_graph_node_ids()
+        self._graph_id_to_idx = {
+            node_id: i for i, node_id in enumerate(self._graph_node_ids)
+        }
+        self._agent_node_id_lists = self._build_agent_node_id_lists()
+        self._attached_rl_ids_by_node = self._build_attached_rl_ids_by_node()
 
         self._edge_index: Tensor | None = None
         self._edge_attr: Tensor | None = None
         self._node_positions: Tensor | None = None
+        self._agent_node_indices: Tensor | None = None
+        self._agent_node_mask: Tensor | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -57,21 +88,37 @@ class GraphBuilder:
         dst_list: list[int] = []
         attrs: list[list[float]] = []
 
-        for tl_id in self.tl_ids:
-            src_idx = self._id_to_idx[tl_id]
-            neighbors = self._get_neighbor_tl_ids_for_tls(tl_id)
-
-            for nbr_id, dist, n_lanes in neighbors:
-                if nbr_id not in self._id_to_idx:
+        if self.mode == "all_intersections":
+            for node_id in self.node_ids:
+                src_idx = self._graph_id_to_idx[node_id]
+                try:
+                    node = self.net.getNode(node_id)
+                except KeyError:
                     continue
-                dst_idx = self._id_to_idx[nbr_id]
-                # One direction per iteration; the reverse is added
-                # when the neighbor node is processed as src_idx,
-                # since _get_neighbor_tl_ids scans both incoming
-                # and outgoing edges.
-                src_list.append(src_idx)
-                dst_list.append(dst_idx)
-                attrs.append([dist, float(n_lanes)])
+                neighbors = self._get_immediate_neighbor_node_ids(node)
+
+                for nbr_id, dist, n_lanes in neighbors:
+                    dst_idx = self._graph_id_to_idx[nbr_id]
+                    src_list.append(src_idx)
+                    dst_list.append(dst_idx)
+                    attrs.append([dist, float(n_lanes)])
+        else:
+            for tl_id in self.tl_ids:
+                src_idx = self._id_to_idx[tl_id]
+                if self.mode == "original":
+                    neighbors = self._get_immediate_neighbor_tl_ids_for_tls(tl_id)
+                else:
+                    neighbors = self._get_neighbor_tl_ids_for_tls(tl_id)
+
+                for nbr_id, dist, n_lanes in neighbors:
+                    if nbr_id not in self._id_to_idx:
+                        continue
+                    dst_idx = self._id_to_idx[nbr_id]
+                    # One direction per iteration; the reverse is added
+                    # when the neighbour is processed as the source.
+                    src_list.append(src_idx)
+                    dst_list.append(dst_idx)
+                    attrs.append([dist, float(n_lanes)])
 
         if not src_list:
             self._edge_index = torch.zeros(2, 0, dtype=torch.long)
@@ -99,7 +146,11 @@ class GraphBuilder:
 
     @property
     def num_nodes(self) -> int:
-        return len(self.tl_ids)
+        return len(self._graph_node_ids)
+
+    @property
+    def node_ids(self) -> list[str]:
+        return list(self._graph_node_ids)
 
     @property
     def node_positions(self) -> Tensor:
@@ -109,18 +160,104 @@ class GraphBuilder:
         the position is the centroid of the controlled SUMO node coordinates.
         """
         if self._node_positions is None:
-            coords = [self._get_position_for_tls(tl_id) for tl_id in self.tl_ids]
+            coords = [self._get_position_for_node(node_id) for node_id in self._graph_node_ids]
             self._node_positions = torch.tensor(coords, dtype=torch.float32)
         return self._node_positions
+
+    @property
+    def agent_node_indices(self) -> Tensor:
+        if self._agent_node_indices is None or self._agent_node_mask is None:
+            self._build_agent_node_index_tensors()
+        assert self._agent_node_indices is not None
+        return self._agent_node_indices
+
+    @property
+    def agent_node_mask(self) -> Tensor:
+        if self._agent_node_indices is None or self._agent_node_mask is None:
+            self._build_agent_node_index_tensors()
+        assert self._agent_node_mask is not None
+        return self._agent_node_mask
+
+    @property
+    def attached_rl_ids_by_node(self) -> list[tuple[str, ...]]:
+        return list(self._attached_rl_ids_by_node)
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _get_immediate_neighbor_tl_ids(
+        self, node: Any
+    ) -> list[tuple[str, float, int]]:
+        """Return immediate ``(neighbor_tl_id, distance, n_lanes)`` tuples."""
+        neighbors: list[tuple[str, float, int]] = []
+        seen: set[str] = set()
+
+        for edge in node.getOutgoing():
+            to_node = edge.getToNode()
+            nbr_id = to_node.getID()
+            if nbr_id in seen or nbr_id == node.getID():
+                continue
+            if nbr_id not in self._id_to_idx:
+                continue
+            seen.add(nbr_id)
+            neighbors.append((nbr_id, float(edge.getLength()), int(edge.getLaneNumber())))
+
+        for edge in node.getIncoming():
+            from_node = edge.getFromNode()
+            nbr_id = from_node.getID()
+            if nbr_id in seen or nbr_id == node.getID():
+                continue
+            if nbr_id not in self._id_to_idx:
+                continue
+            seen.add(nbr_id)
+            neighbors.append((nbr_id, float(edge.getLength()), int(edge.getLaneNumber())))
+
+        return neighbors
+
     def _get_neighbor_tl_ids(
         self, node: Any
     ) -> list[tuple[str, float, int]]:
-        """Return ``(neighbor_tl_id, distance, n_lanes)`` for neighbours."""
+        """Return walk-contracted ``(neighbor_tl_id, distance, n_lanes)`` tuples."""
         return self._find_neighbor_tls(source_tl_id=node.getID(), start_nodes=[node])
+
+    def _get_immediate_neighbor_tl_ids_for_tls(
+        self, tl_id: str
+    ) -> list[tuple[str, float, int]]:
+        controlled_nodes = self._tls_nodes_by_id.get(tl_id)
+        if controlled_nodes:
+            neighbors: list[tuple[str, float, int]] = []
+            seen: set[str] = set()
+            for node in controlled_nodes:
+                for edge in node.getOutgoing():
+                    to_node = edge.getToNode()
+                    nbr_id = self._node_to_tls_id.get(to_node.getID())
+                    if nbr_id is None or nbr_id == tl_id or nbr_id in seen:
+                        continue
+                    if nbr_id not in self._id_to_idx:
+                        continue
+                    seen.add(nbr_id)
+                    neighbors.append(
+                        (nbr_id, float(edge.getLength()), int(edge.getLaneNumber()))
+                    )
+
+                for edge in node.getIncoming():
+                    from_node = edge.getFromNode()
+                    nbr_id = self._node_to_tls_id.get(from_node.getID())
+                    if nbr_id is None or nbr_id == tl_id or nbr_id in seen:
+                        continue
+                    if nbr_id not in self._id_to_idx:
+                        continue
+                    seen.add(nbr_id)
+                    neighbors.append(
+                        (nbr_id, float(edge.getLength()), int(edge.getLaneNumber()))
+                    )
+            return neighbors
+
+        try:
+            node = self.net.getNode(tl_id)
+        except KeyError:
+            return []
+        return self._get_immediate_neighbor_tl_ids(node)
 
     def _get_neighbor_tl_ids_for_tls(self, tl_id: str) -> list[tuple[str, float, int]]:
         """Return ``(neighbor_tl_id, distance, n_lanes)`` for a TLS controller.
@@ -142,6 +279,35 @@ class GraphBuilder:
         except KeyError:
             return []
         return self._get_neighbor_tl_ids(node)
+
+    def _get_immediate_neighbor_node_ids(
+        self,
+        node: Any,
+    ) -> list[tuple[str, float, int]]:
+        neighbors: list[tuple[str, float, int]] = []
+        seen: set[str] = set()
+
+        for edge in node.getOutgoing():
+            to_node = edge.getToNode()
+            nbr_id = to_node.getID()
+            if nbr_id in seen or nbr_id == node.getID():
+                continue
+            if nbr_id not in self._graph_id_to_idx:
+                continue
+            seen.add(nbr_id)
+            neighbors.append((nbr_id, float(edge.getLength()), int(edge.getLaneNumber())))
+
+        for edge in node.getIncoming():
+            from_node = edge.getFromNode()
+            nbr_id = from_node.getID()
+            if nbr_id in seen or nbr_id == node.getID():
+                continue
+            if nbr_id not in self._graph_id_to_idx:
+                continue
+            seen.add(nbr_id)
+            neighbors.append((nbr_id, float(edge.getLength()), int(edge.getLaneNumber())))
+
+        return neighbors
 
     @staticmethod
     def _iter_neighbor_nodes(node: Any) -> list[tuple[Any, float, int]]:
@@ -222,6 +388,69 @@ class GraphBuilder:
             if tl_id in self._id_to_idx
         ]
 
+    def _build_graph_node_ids(self) -> list[str]:
+        if self.mode == "all_intersections":
+            return [node.getID() for node in self.net.getNodes()]
+        return list(self.tl_ids)
+
+    def _build_agent_node_id_lists(self) -> list[list[str]]:
+        agent_node_ids: list[list[str]] = []
+
+        for tl_id in self.tl_ids:
+            if self.mode == "all_intersections":
+                controlled_nodes = self._tls_nodes_by_id.get(tl_id)
+                if controlled_nodes:
+                    raw_ids = [node.getID() for node in controlled_nodes]
+                elif tl_id in self._graph_id_to_idx:
+                    raw_ids = [tl_id]
+                else:
+                    raw_ids = []
+            else:
+                raw_ids = [tl_id]
+
+            deduped = [
+                node_id
+                for node_id in dict.fromkeys(raw_ids)
+                if node_id in self._graph_id_to_idx
+            ]
+            if not deduped:
+                raise ValueError(
+                    f"Could not map traffic-light/controller {tl_id!r} to any graph node "
+                    f"under graph mode {self.mode!r}."
+                )
+            agent_node_ids.append(deduped)
+
+        return agent_node_ids
+
+    def _build_attached_rl_ids_by_node(self) -> list[tuple[str, ...]]:
+        node_to_rl_ids: dict[str, list[str]] = {
+            node_id: [] for node_id in self._graph_node_ids
+        }
+        for tl_id, node_ids in zip(self.tl_ids, self._agent_node_id_lists, strict=True):
+            for node_id in node_ids:
+                node_to_rl_ids.setdefault(node_id, []).append(tl_id)
+        return [
+            tuple(node_to_rl_ids.get(node_id, []))
+            for node_id in self._graph_node_ids
+        ]
+
+    def _build_agent_node_index_tensors(self) -> None:
+        max_nodes_per_agent = max(len(node_ids) for node_ids in self._agent_node_id_lists)
+        indices = torch.full(
+            (len(self.tl_ids), max_nodes_per_agent),
+            -1,
+            dtype=torch.long,
+        )
+        mask = torch.zeros((len(self.tl_ids), max_nodes_per_agent), dtype=torch.bool)
+
+        for agent_idx, node_ids in enumerate(self._agent_node_id_lists):
+            for slot, node_id in enumerate(node_ids):
+                indices[agent_idx, slot] = self._graph_id_to_idx[node_id]
+                mask[agent_idx, slot] = True
+
+        self._agent_node_indices = indices
+        self._agent_node_mask = mask
+
     def _build_tls_node_map(self) -> dict[str, list[Any]]:
         """Map TLS/controller ID -> list of controlled SUMO nodes."""
         if not hasattr(self.net, "getTrafficLights"):
@@ -286,3 +515,13 @@ class GraphBuilder:
 
         x, y = node.getCoord()
         return float(x), float(y)
+
+    def _get_position_for_node(self, node_id: str) -> tuple[float, float]:
+        if self.mode == "all_intersections":
+            try:
+                node = self.net.getNode(node_id)
+            except KeyError:
+                return float("nan"), float("nan")
+            x, y = node.getCoord()
+            return float(x), float(y)
+        return self._get_position_for_tls(node_id)

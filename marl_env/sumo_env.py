@@ -62,9 +62,11 @@ class TrafficSignalEnv:
         begin_time: int = 0,
         end_time: int = 3600,
         additional_files: list[str] | None = None,
+        graph_builder_mode: str = "original",
     ) -> None:
         self.delta_t = delta_t
         self.net_file = net_file
+        self.graph_builder_mode = graph_builder_mode
 
         # --- SUMO adapter ---
         self.adapter = TraCIAdapter(
@@ -94,6 +96,9 @@ class TrafficSignalEnv:
         self.graph_builder: GraphBuilder | None = None
         self.edge_index: Tensor | None = None
         self.edge_attr: Tensor | None = None
+        self.graph_node_ids: list[str] = []
+        self.agent_node_indices: Tensor | None = None
+        self.agent_node_mask: Tensor | None = None
 
         # Per-agent caches
         self._green_phases: dict[str, list[int]] = {}
@@ -113,6 +118,8 @@ class TrafficSignalEnv:
         self._depart_time_by_vehicle: dict[str, float] = {}
         self._episode_travel_time_sum_s: float = 0.0
         self._episode_arrived_vehicles: int = 0
+        self._node_incoming_lanes: dict[str, list[str]] = {}
+        self._node_attached_rl_ids: dict[str, tuple[str, ...]] = {}
 
     # ==================================================================
     # Core gym-like interface
@@ -130,8 +137,24 @@ class TrafficSignalEnv:
         self.n_agents = len(self.tl_ids)
 
         # Build static graph once
-        self.graph_builder = GraphBuilder(self.net_file, self.tl_ids)
+        self.graph_builder = GraphBuilder(
+            self.net_file,
+            self.tl_ids,
+            mode=self.graph_builder_mode,
+        )
         self.edge_index, self.edge_attr = self.graph_builder.build()
+        self.graph_node_ids = self.graph_builder.node_ids
+        self.agent_node_indices = self.graph_builder.agent_node_indices
+        self.agent_node_mask = self.graph_builder.agent_node_mask
+        self._node_incoming_lanes = self._build_graph_node_incoming_lane_map()
+        self._node_attached_rl_ids = {
+            node_id: attached
+            for node_id, attached in zip(
+                self.graph_node_ids,
+                self.graph_builder.attached_rl_ids_by_node,
+                strict=True,
+            )
+        }
 
         # Cache phase info & register constraints per agent
         for tl_id in self.tl_ids:
@@ -162,9 +185,10 @@ class TrafficSignalEnv:
             )
 
         # Fixed observation dimensions (for padding)
-        self._max_lanes = max(
-            len(self._controlled_lanes[tl]) for tl in self.tl_ids
-        )
+        lane_counts = [len(self._controlled_lanes[tl]) for tl in self.tl_ids]
+        if self.graph_builder_mode == "all_intersections":
+            lane_counts.extend(len(lanes) for lanes in self._node_incoming_lanes.values())
+        self._max_lanes = max(lane_counts) if lane_counts else 0
         self._max_green = max(
             len(self._green_phases[tl]) for tl in self.tl_ids
         )
@@ -313,6 +337,7 @@ class TrafficSignalEnv:
             obs_list.append(self._get_observation(tl_id))
 
         obs = torch.stack(obs_list, dim=0)  # [n_agents, d_obs]
+        graph_obs = self._build_graph_observation(obs)
 
         # Action masks
         masks: list[Tensor] = []
@@ -336,6 +361,9 @@ class TrafficSignalEnv:
         td = TensorDict(
             {
                 "agents": agents_td,
+                "graph_observation": graph_obs,
+                "agent_node_indices": self.agent_node_indices,
+                "agent_node_mask": self.agent_node_mask,
                 "edge_index": self.edge_index,
             },
             batch_size=[],
@@ -360,15 +388,19 @@ class TrafficSignalEnv:
             t = t[:target_len]
         return t
 
-    def _get_observation(self, tl_id: str) -> Tensor:
-        """Build observation vector for one intersection.
+    def _build_observation_from_lanes_and_phase(
+        self,
+        lanes: list[str],
+        *,
+        phase_owner_tl_id: str | None,
+    ) -> Tensor:
+        """Build one observation vector from lane metrics and optional phase state.
 
         Layout (padded to uniform size)::
 
             [queue(max_lanes) | wait(max_lanes) | occ(max_lanes)
              | speed(max_lanes) | phase_onehot(max_green) | elapsed(1)]
         """
-        lanes = self._controlled_lanes[tl_id]
         ml = self._max_lanes
 
         queue = self._pad_1d(
@@ -385,19 +417,69 @@ class TrafficSignalEnv:
         )
 
         # Phase one-hot (padded to max_green)
-        current_gp = self._current_green[tl_id]
-        if current_gp in self._green_phases[tl_id]:
-            action_idx = self.constraints.green_phase_to_action(tl_id, current_gp)
-        else:
-            action_idx = 0
         phase_onehot = torch.zeros(self._max_green, dtype=torch.float32)
-        phase_onehot[action_idx] = 1.0
+        elapsed_value = 0.0
+        if phase_owner_tl_id is not None:
+            current_gp = self._current_green[phase_owner_tl_id]
+            if current_gp in self._green_phases[phase_owner_tl_id]:
+                action_idx = self.constraints.green_phase_to_action(
+                    phase_owner_tl_id,
+                    current_gp,
+                )
+            else:
+                action_idx = 0
+            phase_onehot[action_idx] = 1.0
+            elapsed_value = self._elapsed_green[phase_owner_tl_id]
 
-        elapsed = torch.tensor(
-            [self._elapsed_green[tl_id]], dtype=torch.float32
-        )
+        elapsed = torch.tensor([elapsed_value], dtype=torch.float32)
 
         return torch.cat([queue, wait, occ, speed, phase_onehot, elapsed])
+
+    def _get_observation(self, tl_id: str) -> Tensor:
+        """Build observation vector for one controlled traffic light."""
+        return self._build_observation_from_lanes_and_phase(
+            self._controlled_lanes[tl_id],
+            phase_owner_tl_id=tl_id,
+        )
+
+    def _build_graph_observation(self, agent_obs: Tensor) -> Tensor:
+        if self.graph_builder_mode != "all_intersections":
+            return agent_obs.clone()
+
+        graph_obs_list = [
+            self._get_graph_node_observation(node_id)
+            for node_id in self.graph_node_ids
+        ]
+        return torch.stack(graph_obs_list, dim=0)
+
+    def _get_graph_node_observation(self, node_id: str) -> Tensor:
+        attached_rl_ids = self._node_attached_rl_ids.get(node_id, ())
+        phase_owner = attached_rl_ids[0] if attached_rl_ids else None
+        lanes = self._node_incoming_lanes.get(node_id, [])
+        return self._build_observation_from_lanes_and_phase(
+            lanes,
+            phase_owner_tl_id=phase_owner,
+        )
+
+    def _build_graph_node_incoming_lane_map(self) -> dict[str, list[str]]:
+        if self.graph_builder is None or self.graph_builder_mode != "all_intersections":
+            return {}
+
+        node_lanes: dict[str, list[str]] = {}
+        for node_id in self.graph_node_ids:
+            try:
+                node = self.graph_builder.net.getNode(node_id)
+            except KeyError:
+                node_lanes[node_id] = []
+                continue
+
+            lane_ids: list[str] = []
+            for edge in node.getIncoming():
+                if hasattr(edge, "getLanes"):
+                    lane_ids.extend(lane.getID() for lane in edge.getLanes())
+            node_lanes[node_id] = lane_ids
+
+        return node_lanes
 
     # ==================================================================
     # Reward

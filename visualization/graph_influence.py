@@ -69,6 +69,12 @@ class EncoderInfluenceModel(nn.Module):
         return self.encoder(x, edge_index, edge_attr_to_use)
 
 
+def format_node_label(node_id: str, attached_rl_ids: tuple[str, ...] | list[str]) -> str:
+    if not attached_rl_ids:
+        return node_id
+    return f"{node_id}\n[{', '.join(attached_rl_ids)}]"
+
+
 def deduplicate_undirected_edges(edge_index: Tensor) -> list[tuple[int, int]]:
     """Collapse reciprocal directed edges into a stable undirected view."""
     unique_edges: list[tuple[int, int]] = []
@@ -307,11 +313,13 @@ def count_episode_steps(
 
     while True:
         actions, _ = agent.select_action(
-            td["agents", "observation"],
+            td.get("graph_observation", td["agents", "observation"]),
             td["edge_index"],
             td.get("edge_attr", None),
             td["agents", "action_mask"],
             deterministic=True,
+            agent_node_indices=td["agent_node_indices"],
+            agent_node_mask=td["agent_node_mask"],
         )
 
         next_td = env.step(actions.cpu()).to(device)
@@ -338,24 +346,27 @@ def collect_snapshot_graphs(
 
     while True:
         if step_index in wanted:
+            graph_obs = td.get("graph_observation", td["agents", "observation"])
             snapshots.append(
                 SnapshotGraph(
                     step_index=step_index,
                     data=Data(
-                        x=td["agents", "observation"].detach().cpu(),
+                        x=graph_obs.detach().cpu(),
                         edge_index=td["edge_index"].detach().cpu(),
                         edge_attr=_extract_edge_attr(td),
-                        num_nodes=int(td["agents", "observation"].shape[0]),
+                        num_nodes=int(graph_obs.shape[0]),
                     ),
                 )
             )
 
         actions, _ = agent.select_action(
-            td["agents", "observation"],
+            td.get("graph_observation", td["agents", "observation"]),
             td["edge_index"],
             td.get("edge_attr", None),
             td["agents", "action_mask"],
             deterministic=True,
+            agent_node_indices=td["agent_node_indices"],
+            agent_node_mask=td["agent_node_mask"],
         )
 
         next_td = env.step(actions.cpu()).to(device)
@@ -379,7 +390,7 @@ def load_agent_for_visualization(
     num_actions: int,
     device: torch.device,
 ) -> MARLDiscreteSAC:
-    obs_dim = int(td0["agents", "observation"].shape[-1])
+    obs_dim = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
 
     agent = MARLDiscreteSAC(
         obs_dim=obs_dim,
@@ -503,7 +514,9 @@ def plot_graph_topology(
     out_path: Path,
     positions: Tensor,
     edge_index: Tensor,
-    tl_ids: list[str],
+    node_labels: list[str],
+    *,
+    method_name: str,
     road_segments: list[RoadSegment] | None = None,
 ) -> None:
     edges = deduplicate_undirected_edges(edge_index)
@@ -525,7 +538,7 @@ def plot_graph_topology(
     _plot_edges(ax, positions, edges, color="#0069C0", linewidth=2.2, alpha=0.98)
 
     valid = torch.isfinite(positions).all(dim=1)
-    node_size = 70 if len(tl_ids) <= 100 else 12
+    node_size = 70 if len(node_labels) <= 100 else 12
     ax.scatter(
         positions[valid, 0].tolist(),
         positions[valid, 1].tolist(),
@@ -536,14 +549,14 @@ def plot_graph_topology(
         zorder=3,
     )
 
-    if len(tl_ids) <= 100:
-        for idx, tl_id in enumerate(tl_ids):
+    if len(node_labels) <= 100:
+        for idx, node_label in enumerate(node_labels):
             if not bool(valid[idx]):
                 continue
             ax.text(
                 float(positions[idx, 0]),
                 float(positions[idx, 1]),
-                tl_id,
+                node_label,
                 fontsize=6,
                 ha="center",
                 va="bottom",
@@ -551,7 +564,7 @@ def plot_graph_topology(
             )
 
     ax.set_title(
-        f"Intersection Graph Topology ({len(tl_ids)} nodes, {len(edges)} undirected edges)"
+        f"Intersection Graph Topology [{method_name}] ({len(node_labels)} nodes, {len(edges)} undirected edges)"
     )
     _style_map_axes(ax, positions, road_segments)
     fig.tight_layout()
@@ -594,8 +607,10 @@ def plot_node_influence_map(
     out_path: Path,
     positions: Tensor,
     edge_index: Tensor,
-    tl_ids: list[str],
+    node_labels: list[str],
     node_rows: list[dict[str, Any]],
+    *,
+    method_name: str,
     road_segments: list[RoadSegment] | None = None,
 ) -> None:
     edges = deduplicate_undirected_edges(edge_index)
@@ -639,7 +654,7 @@ def plot_node_influence_map(
         scatter = ax.scatter(
             xs,
             ys,
-            s=16 if len(tl_ids) > 100 else 55,
+            s=16 if len(node_labels) > 100 else 55,
             c=vals,
             cmap="viridis",
             edgecolors="white",
@@ -649,21 +664,21 @@ def plot_node_influence_map(
         cbar = fig.colorbar(scatter, ax=ax, shrink=0.8)
         cbar.set_label("Influence-weighted receptive field $R_i$")
 
-    if len(tl_ids) <= 100:
+    if len(node_labels) <= 100:
         for row in sampled_rows:
             if not row["has_position"]:
                 continue
             ax.text(
                 row["x"],
                 row["y"],
-                row["tl_id"],
+                row["node_label"],
                 fontsize=6,
                 ha="center",
                 va="bottom",
                 zorder=5,
             )
 
-    ax.set_title("Representative Snapshot: Node Influence Breadth")
+    ax.set_title(f"Representative Snapshot: Node Influence Breadth [{method_name}]")
     _style_map_axes(ax, positions, road_segments)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -682,7 +697,8 @@ def write_node_influence_csv(
     hop_fields = [f"hop_{hop}" for hop in range(max_hops + 1)]
     fieldnames = [
         "node_index",
-        "tl_id",
+        "node_id",
+        "attached_rl_ids",
         "x",
         "y",
         "has_position",
@@ -738,7 +754,8 @@ def compute_node_influence_rows(
     model: nn.Module,
     snapshot: SnapshotGraph,
     positions: Tensor,
-    tl_ids: list[str],
+    node_ids: list[str],
+    attached_rl_ids_by_node: list[tuple[str, ...]],
     *,
     max_hops: int,
     num_samples: int,
@@ -747,11 +764,14 @@ def compute_node_influence_rows(
     sampled_nodes = set(select_sampled_nodes(snapshot.data.num_nodes, num_samples, seed=snapshot.step_index))
     node_rows: list[dict[str, Any]] = []
 
-    for node_idx, tl_id in enumerate(tl_ids):
+    for node_idx, node_id in enumerate(node_ids):
+        attached_rl_ids = attached_rl_ids_by_node[node_idx]
         has_position = bool(torch.isfinite(positions[node_idx]).all())
         row: dict[str, Any] = {
             "node_index": node_idx,
-            "tl_id": tl_id,
+            "node_id": node_id,
+            "attached_rl_ids": ",".join(attached_rl_ids),
+            "node_label": format_node_label(node_id, attached_rl_ids),
             "x": float(positions[node_idx, 0].item()) if has_position else "",
             "y": float(positions[node_idx, 1].item()) if has_position else "",
             "has_position": has_position,
@@ -806,11 +826,21 @@ def run_visualization(
     env = TrafficSignalEnv(**env_cfg)
     try:
         td0 = env.reset()
-        tl_ids = list(env.tl_ids)
+        node_ids = list(env.graph_builder.node_ids)  # type: ignore[union-attr]
+        attached_rl_ids_by_node = list(env.graph_builder.attached_rl_ids_by_node)  # type: ignore[union-attr]
+        node_labels = [
+            format_node_label(node_id, attached_rl_ids)
+            for node_id, attached_rl_ids in zip(
+                node_ids,
+                attached_rl_ids_by_node,
+                strict=True,
+            )
+        ]
         positions = env.graph_builder.node_positions.detach().cpu()  # type: ignore[union-attr]
         road_segments = extract_road_segments(env.graph_builder.net)  # type: ignore[union-attr]
         edge_index = td0["edge_index"].detach().cpu()
         edge_attr = _extract_edge_attr(td0)
+        graph_builder_mode = env.graph_builder.mode  # type: ignore[union-attr]
 
         agent = load_agent_for_visualization(
             checkpoint_path=checkpoint_path,
@@ -829,7 +859,7 @@ def run_visualization(
     finally:
         env.close()
 
-    num_nodes = len(tl_ids)
+    num_nodes = len(node_ids)
     resolved_curve_samples = resolve_curve_num_samples(num_nodes, curve_num_samples)
     resolved_map_samples = resolve_map_num_samples(num_nodes, map_num_samples)
 
@@ -846,7 +876,8 @@ def run_visualization(
         influence_model,
         representative_snapshot,
         positions,
-        tl_ids,
+        node_ids,
+        attached_rl_ids_by_node,
         max_hops=resolved_max_hops,
         num_samples=resolved_map_samples,
         device=device_obj,
@@ -856,7 +887,8 @@ def run_visualization(
         out_dir / "graph_topology.png",
         positions,
         edge_index,
-        tl_ids,
+        node_labels,
+        method_name=graph_builder_mode,
         road_segments=road_segments,
     )
     plot_influence_curve(
@@ -869,8 +901,9 @@ def run_visualization(
         out_dir / "influence_map.png",
         positions,
         edge_index,
-        tl_ids,
+        node_labels,
         node_rows,
+        method_name=graph_builder_mode,
         road_segments=road_segments,
     )
 
@@ -878,8 +911,9 @@ def run_visualization(
         "checkpoint_path": str(checkpoint_path),
         "net_file": str(env_cfg["net_file"]),
         "route_file": str(env_cfg["route_file"]),
+        "graph_builder_mode": graph_builder_mode,
         "device": str(device_obj),
-        "num_nodes": len(tl_ids),
+        "num_nodes": len(node_ids),
         "num_directed_edges": int(edge_index.shape[1]),
         "num_undirected_edges": len(deduplicate_undirected_edges(edge_index)),
         "num_road_segments": len(road_segments),
@@ -896,6 +930,14 @@ def run_visualization(
             [float(v) for v in curve.tolist()]
             for curve in snapshot_curves
         ],
+        "node_to_rl_ids": {
+            node_id: list(attached_rl_ids)
+            for node_id, attached_rl_ids in zip(
+                node_ids,
+                attached_rl_ids_by_node,
+                strict=True,
+            )
+        },
         "artifacts": {
             "graph_topology": str(out_dir / "graph_topology.png"),
             "influence_curve": str(out_dir / "influence_curve.png"),

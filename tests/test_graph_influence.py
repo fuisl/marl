@@ -12,6 +12,7 @@ from torch_geometric.utils import get_num_hops
 
 from config_utils import resolve_repo_path
 from models.graph_encoder import GraphEncoder
+from models.marl_discrete_sac import MARLDiscreteSAC
 from visualization.graph_influence import (
     EncoderInfluenceModel,
     _total_influence_with_edge_attr,
@@ -120,6 +121,30 @@ def test_extract_road_segments_skips_internal_edges() -> None:
     assert segments[0].lanes == 2
     assert segments[0].points == ((0.0, 0.0), (1.0, 1.0))
     assert segments[1].points[-1] == (5.0, 4.0)
+
+
+def test_agent_pooling_averages_multiple_graph_nodes_per_rl_agent() -> None:
+    z_nodes = torch.tensor(
+        [
+            [1.0, 0.0],
+            [3.0, 2.0],
+            [10.0, 4.0],
+        ],
+        dtype=torch.float32,
+    )
+    agent_node_indices = torch.tensor([[0, 1], [2, -1]], dtype=torch.long)
+    agent_node_mask = torch.tensor([[True, True], [True, False]])
+
+    pooled = MARLDiscreteSAC._pool_agent_latents(
+        z_nodes,
+        agent_node_indices=agent_node_indices,
+        agent_node_mask=agent_node_mask,
+    )
+
+    assert torch.allclose(
+        pooled,
+        torch.tensor([[2.0, 1.0], [10.0, 4.0]], dtype=torch.float32),
+    )
 
 
 @pytest.mark.sumo

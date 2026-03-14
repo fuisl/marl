@@ -31,6 +31,7 @@ end_time: 28800
 
 sumo_binary: sumo
 gui: false
+graph_builder_mode: original
 
 # Bus stop definitions required for bus routes.
 additional_files:
