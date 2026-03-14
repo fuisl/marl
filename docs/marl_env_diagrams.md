@@ -1,5 +1,7 @@
 # Current MARL Implementation Diagrams
 
+See also: [CTDE Graph-SAC Architecture](./ctde_graph_sac_architecture.md)
+
 This report documents the current end-to-end architecture and the baseline training path used in this repository.
 
 ## 1. System Context in the Project
