@@ -110,6 +110,9 @@ class TrafficSignalEnv:
             "departed_vehicles": 0.0,
             "teleported_vehicles": 0.0,
         }
+        self._depart_time_by_vehicle: dict[str, float] = {}
+        self._episode_travel_time_sum_s: float = 0.0
+        self._episode_arrived_vehicles: int = 0
 
     # ==================================================================
     # Core gym-like interface
@@ -118,6 +121,9 @@ class TrafficSignalEnv:
         """Start a new episode. Returns initial observation ``TensorDict``."""
         self.adapter.close()  # no-op on first call
         self.adapter.start()
+        self._depart_time_by_vehicle = {}
+        self._episode_travel_time_sum_s = 0.0
+        self._episode_arrived_vehicles = 0
 
         # Discover agents
         self.tl_ids = self.adapter.get_traffic_light_ids()
@@ -196,6 +202,17 @@ class TrafficSignalEnv:
             departed_total += float(self.adapter.get_departed_number())
             teleported_total += float(self.adapter.get_teleported_number())
 
+            now = float(self.adapter.current_time)
+            for vid in self.adapter.get_departed_ids():
+                # Record first observed departure time.
+                self._depart_time_by_vehicle.setdefault(vid, now)
+            for vid in self.adapter.get_arrived_ids():
+                t_depart = self._depart_time_by_vehicle.pop(vid, None)
+                if t_depart is None:
+                    continue
+                self._episode_travel_time_sum_s += max(0.0, now - t_depart)
+                self._episode_arrived_vehicles += 1
+
         self._last_interval_flow = {
             "arrived_vehicles": arrived_total,
             "departed_vehicles": departed_total,
@@ -230,8 +247,8 @@ class TrafficSignalEnv:
 
         if not lane_ids:
             return {
-                "avg_waiting_time_s": 0.0,
-                "avg_queue_halting": 0.0,
+                "avg_delay_s": 0.0,
+                "avg_queue_length": 0.0,
                 "avg_speed_mps": 0.0,
                 "avg_occupancy_pct": 0.0,
                 "min_expected_vehicles": float(self.adapter.min_expected_vehicles),
@@ -239,18 +256,34 @@ class TrafficSignalEnv:
             }
 
         lane_count = float(len(lane_ids))
-        avg_waiting = sum(self.adapter.get_lane_waiting_time(l) for l in lane_ids) / lane_count
+        total_waiting = sum(self.adapter.get_lane_waiting_time(l) for l in lane_ids)
+        total_vehicles = sum(self.adapter.get_lane_vehicle_count(l) for l in lane_ids)
+
+        # Per-vehicle delay is more stable across different network sizes.
+        avg_waiting = total_waiting / max(float(total_vehicles), 1.0)
         avg_queue = sum(self.adapter.get_lane_halting_number(l) for l in lane_ids) / lane_count
         avg_speed = sum(self.adapter.get_lane_mean_speed(l) for l in lane_ids) / lane_count
         avg_occupancy = sum(self.adapter.get_lane_occupancy(l) for l in lane_ids) / lane_count
 
         return {
-            "avg_waiting_time_s": float(avg_waiting),
-            "avg_queue_halting": float(avg_queue),
+            "avg_delay_s": float(avg_waiting),
+            "avg_queue_length": float(avg_queue),
             "avg_speed_mps": float(avg_speed),
             "avg_occupancy_pct": float(avg_occupancy),
             "min_expected_vehicles": float(self.adapter.min_expected_vehicles),
+            "network_total_waiting_s": float(total_waiting),
+            "network_total_vehicles": float(total_vehicles),
             **self._last_interval_flow,
+        }
+
+    def get_episode_kpis(self) -> dict[str, float]:
+        """Return episode-level KPIs commonly reported in traffic RL papers."""
+        avg_travel_time = 0.0
+        if self._episode_arrived_vehicles > 0:
+            avg_travel_time = self._episode_travel_time_sum_s / self._episode_arrived_vehicles
+        return {
+            "avg_travel_time_s": float(avg_travel_time),
+            "arrived_vehicles": float(self._episode_arrived_vehicles),
         }
 
     # ==================================================================

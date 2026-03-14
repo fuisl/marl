@@ -167,8 +167,14 @@ class TraCIAdapter:
     def get_departed_number(self) -> int:
         return self._require_conn().simulation.getDepartedNumber()
 
+    def get_departed_ids(self) -> list[str]:
+        return list(self._require_conn().simulation.getDepartedIDList())
+
     def get_arrived_number(self) -> int:
         return self._require_conn().simulation.getArrivedNumber()
+
+    def get_arrived_ids(self) -> list[str]:
+        return list(self._require_conn().simulation.getArrivedIDList())
 
     def get_teleported_number(self) -> int:
         return self._require_conn().simulation.getStartingTeleportNumber()
