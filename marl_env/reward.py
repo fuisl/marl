@@ -20,6 +20,7 @@ class IntersectionMetrics:
     waiting_times: list[float] = field(default_factory=list)
     mean_speeds: list[float] = field(default_factory=list)
     occupancies: list[float] = field(default_factory=list)
+    pressure: float = 0.0
     throughput: int = 0  # vehicles that cleared the intersection this step
 
 
@@ -29,12 +30,12 @@ class RewardCalculator:
     Parameters
     ----------
     mode : str
-        One of ``"queue"``, ``"wait"``, ``"pressure"``, ``"combined"``.
+        One of ``"queue"``, ``"wait"``, ``"pressure"``, ``"pressure_queue"``, ``"combined"``.
     weights : dict[str, float] | None
-        Weights for ``"combined"`` mode.
+        Weights for ``"combined"`` and ``"pressure_queue"`` modes.
     """
 
-    MODES = ("queue", "wait", "pressure", "combined")
+    MODES = ("queue", "wait", "pressure", "pressure_queue", "combined")
 
     def __init__(
         self,
@@ -49,6 +50,7 @@ class RewardCalculator:
             "wait": -0.25,
             "speed": 0.25,
             "throughput": 0.25,
+            "pressure": 1.0,
         }
 
     # ------------------------------------------------------------------
@@ -61,6 +63,8 @@ class RewardCalculator:
             return self._wait_reward(metrics)
         if self.mode == "pressure":
             return self._pressure_reward(metrics)
+        if self.mode == "pressure_queue":
+            return self._pressure_queue_reward(metrics)
         return self._combined_reward(metrics)
 
     def compute_batch(
@@ -90,10 +94,15 @@ class RewardCalculator:
 
     @staticmethod
     def _pressure_reward(m: IntersectionMetrics) -> float:
-        # Pressure = |incoming_queue - outgoing_queue|
-        # Simplified: negative total queue as proxy
-        lane_count = RewardCalculator._lane_count(m)
-        return -sum(m.queue_lengths) / lane_count
+        # Pressure penalty is the negative absolute queue imbalance.
+        return -abs(float(m.pressure))
+
+    def _pressure_queue_reward(self, m: IntersectionMetrics) -> float:
+        lane_count = self._lane_count(m)
+        queue_norm = sum(m.queue_lengths) / lane_count
+        lambda_queue = float(self.weights.get("queue", 0.1))
+        pressure_weight = float(self.weights.get("pressure", 1.0))
+        return -pressure_weight * abs(float(m.pressure)) - lambda_queue * queue_norm
 
     def _combined_reward(self, m: IntersectionMetrics) -> float:
         w = self.weights

@@ -31,6 +31,7 @@ Outputs
 from __future__ import annotations
 
 import collections
+from collections.abc import Mapping
 import csv
 import os
 import random
@@ -257,7 +258,7 @@ def run_episode(
 def sac_update(
     loss_fn: DiscreteSACLossComputer,
     replay: ReplayBuffer,
-    optimizers: dict[str, torch.optim.Optimizer],
+    optimizers: Mapping[str, torch.optim.Optimizer],
     batch_size: int,
     device: torch.device,
 ) -> dict[str, float] | None:
@@ -310,7 +311,7 @@ def sac_update(
 def train(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = int(cfg.train.seed)
-    optimizer_name = str(cfg.train.optimizer.name)
+    base_optimizer_name = str(cfg.train.optimizer.name)
     reward_mode = str(cfg.env.reward_mode)
     print(f"[train_gat_baseline] device={device}")
     print(f"  net:   {cfg.env.net_file}")
@@ -368,14 +369,20 @@ def train(cfg: DictConfig) -> None:
     print(f"  agent params: {total_params:,}")
 
     # --- Optimizers ---
-    optim_cfg = maybe_to_container(cfg.train.optimizer)
+    optim_cfg_default = maybe_to_container(cfg.train.optimizer)
+    optim_actor_cfg = maybe_to_container(cfg.train.get("optimizer_actor", cfg.train.optimizer))
+    optim_critic_cfg = maybe_to_container(cfg.train.get("optimizer_critic", cfg.train.optimizer))
+    optim_alpha_cfg = maybe_to_container(cfg.train.get("optimizer_alpha", cfg.train.optimizer))
     opt_enc_actor = make_optimizer(
         list(agent.encoder.parameters()) + list(agent.actor.parameters()),
-        optim_cfg,
+        optim_actor_cfg,
     )
-    opt_critic = make_optimizer(agent.critic.parameters(), optim_cfg)
-    opt_alpha  = make_optimizer([agent.log_alpha], optim_cfg)
+    opt_critic = make_optimizer(agent.critic.parameters(), optim_critic_cfg)
+    opt_alpha  = make_optimizer([agent.log_alpha], optim_alpha_cfg)
     optimizers = {"actor": opt_enc_actor, "critic": opt_critic, "alpha": opt_alpha}
+
+    actor_opt_name = str(optim_actor_cfg.get("name", base_optimizer_name))
+    critic_opt_name = str(optim_critic_cfg.get("name", base_optimizer_name))
 
     # --- Loss & Replay ---
     loss_fn = DiscreteSACLossComputer(agent, gamma=float(cfg.train.gamma))
@@ -386,13 +393,17 @@ def train(cfg: DictConfig) -> None:
     if use_wandb:
         run_name = cfg.wandb.run_name
         if not run_name:
-            run_name = f"gat_{optimizer_name}_{reward_mode}_seed{seed}"
+            run_name = f"gat_a{actor_opt_name}_c{critic_opt_name}_{reward_mode}_seed{seed}"
+        wandb_cfg_raw = OmegaConf.to_container(cfg, resolve=True)
+        wandb_cfg: dict[str, Any] | None = None
+        if isinstance(wandb_cfg_raw, dict):
+            wandb_cfg = {str(k): v for k, v in wandb_cfg_raw.items()}
         wandb.init(
             project=str(cfg.wandb.project),
             name=str(run_name),
-            config=OmegaConf.to_container(cfg, resolve=True),
+            config=wandb_cfg,
             dir=str(out_dir),
-            tags=["gat", "discrete-sac", "marl", "sumo-5x5", optimizer_name, reward_mode],
+            tags=["gat", "discrete-sac", "marl", "sumo-5x5", actor_opt_name, critic_opt_name, reward_mode],
         )
         wandb.define_metric("train/episode")
         wandb.define_metric("train/*", step_metric="train/episode")
@@ -404,17 +415,21 @@ def train(cfg: DictConfig) -> None:
             "obs_dim": obs_dim,
             "num_actions": num_actions,
             "graph_edges": n_edges,
-            "optimizer": optimizer_name,
+            "optimizer_actor": actor_opt_name,
+            "optimizer_critic": critic_opt_name,
             "reward_mode": reward_mode,
         }
         wandb.config.update({"run_metadata": run_metadata}, allow_val_change=True)
-        wandb.run.summary["run_name"] = str(run_name)
-        wandb.run.summary["optimizer"] = optimizer_name
-        wandb.run.summary["reward_mode"] = reward_mode
-        wandb.run.summary["n_agents"] = n_agents
-        wandb.run.summary["obs_dim"] = obs_dim
-        wandb.run.summary["num_actions"] = num_actions
-        wandb.run.summary["graph_edges"] = n_edges
+        run_obj = wandb.run
+        if run_obj is not None:
+            run_obj.summary["run_name"] = str(run_name)
+            run_obj.summary["optimizer_actor"] = actor_opt_name
+            run_obj.summary["optimizer_critic"] = critic_opt_name
+            run_obj.summary["reward_mode"] = reward_mode
+            run_obj.summary["n_agents"] = n_agents
+            run_obj.summary["obs_dim"] = obs_dim
+            run_obj.summary["num_actions"] = num_actions
+            run_obj.summary["graph_edges"] = n_edges
 
     # --- Logging ---
     out_dir.mkdir(parents=True, exist_ok=True)

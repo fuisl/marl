@@ -330,9 +330,27 @@ class TrafficSignalEnv:
                 waiting_times=[self.adapter.get_lane_waiting_time(l) for l in lanes],
                 mean_speeds=[self.adapter.get_lane_mean_speed(l) for l in lanes],
                 occupancies=[self.adapter.get_lane_occupancy(l) for l in lanes],
+                pressure=self._compute_intersection_pressure(tl_id, lanes),
             )
             metrics_list.append(m)
         return self.reward_calc.compute_batch(metrics_list)
+
+    def _compute_intersection_pressure(self, tl_id: str, incoming_lanes: list[str]) -> float:
+        """Compute queue pressure = incoming halting - outgoing halting.
+
+        Outgoing lanes are inferred from controlled links and deduplicated.
+        """
+        in_queue = sum(self.adapter.get_lane_halting_number(l) for l in incoming_lanes)
+
+        outgoing_lanes: set[str] = set()
+        for signal_links in self.adapter.get_controlled_links(tl_id):
+            for link in signal_links:
+                # Each link tuple is (in_lane, out_lane, via_lane)
+                if len(link) >= 2 and link[1]:
+                    outgoing_lanes.add(link[1])
+
+        out_queue = sum(self.adapter.get_lane_halting_number(l) for l in outgoing_lanes)
+        return float(in_queue - out_queue)
 
     # ==================================================================
     # Phase helpers

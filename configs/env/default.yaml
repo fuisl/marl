@@ -8,7 +8,7 @@ net_file: nets/grid5x5/grid5x5.net.xml
 route_file: nets/grid5x5/grid5x5.rou.xml
 
 # Decision interval (simulation seconds between RL decisions)
-delta_t: 5
+delta_t: 10
 begin_time: 0
 end_time: 3600
 
@@ -20,14 +20,12 @@ gui: false
 additional_files: null
 
 # Reward function
-reward_mode: combined
+reward_mode: pressure_queue
 reward_weights:
-  queue: -0.25
-  wait: -0.25
-  speed: 0.25
-  throughput: 0.25
+  pressure: 1.0
+  queue: 0.1
 
 # Phase-transition constraints
 yellow_duration: 3
-all_red_duration: 1
-min_green_duration: 5
+all_red_duration: 2
+min_green_duration: 10
