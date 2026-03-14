@@ -394,9 +394,9 @@ def train(cfg: DictConfig) -> None:
             dir=str(out_dir),
             tags=["gat", "discrete-sac", "marl", "sumo-5x5", optimizer_name, reward_mode],
         )
-        wandb.define_metric("episode")
-        wandb.define_metric("train/*", step_metric="episode")
-        wandb.define_metric("debug/*", step_metric="episode")
+        wandb.define_metric("train/episode")
+        wandb.define_metric("train/*", step_metric="train/episode")
+        wandb.define_metric("debug/*", step_metric="train/episode")
 
         run_metadata = {
             "device": str(device),
@@ -500,7 +500,7 @@ def train(cfg: DictConfig) -> None:
                 "train/policy_entropy":        last_metrics.get("entropy",     float("nan")),
                 "train/alpha":                 last_metrics.get("alpha",       float("nan")),
                 "train/best_episode_return":   best_return,
-            }, step=ep)
+            })
 
         # --- Console ---
         if ep % int(cfg.train.log_interval) == 0 or ep == 1:
