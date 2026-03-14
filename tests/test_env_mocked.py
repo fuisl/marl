@@ -92,6 +92,39 @@ class FakeTraCIAdapter:
     def get_controlled_lanes(self, tl_id: str) -> list[str]:
         return self.lanes[tl_id]
 
+    def get_controlled_links(self, tl_id: str) -> list[list[tuple[str, str, str]]]:
+        # Mimic TraCI shape: list over signal indices, each containing
+        # (in_lane, out_lane, via_lane) tuples.
+        lanes = self.lanes[tl_id]
+        return [
+            [(lanes[0], lanes[0], "")],
+            [(lanes[1], lanes[1], "")],
+        ]
+
+    @staticmethod
+    def get_arrived_number() -> int:
+        return 0
+
+    @staticmethod
+    def get_departed_number() -> int:
+        return 0
+
+    @staticmethod
+    def get_teleported_number() -> int:
+        return 0
+
+    @staticmethod
+    def get_arrived_ids() -> list[str]:
+        return []
+
+    @staticmethod
+    def get_departed_ids() -> list[str]:
+        return []
+
+    @staticmethod
+    def get_lane_vehicle_count(lane_id: str) -> int:
+        return 1 if lane_id.endswith("1") else 2
+
     @staticmethod
     def get_lane_halting_number(lane_id: str) -> int:
         return 1 if lane_id.endswith("1") else 2
