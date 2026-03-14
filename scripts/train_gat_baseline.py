@@ -309,12 +309,15 @@ def sac_update(
 
 def train(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    seed = int(cfg.train.seed)
+    optimizer_name = str(cfg.train.optimizer.name)
+    reward_mode = str(cfg.env.reward_mode)
     print(f"[train_gat_baseline] device={device}")
     print(f"  net:   {cfg.env.net_file}")
     print(f"  route: {cfg.env.route_file}")
 
-    torch.manual_seed(int(cfg.train.seed))
-    random.seed(int(cfg.train.seed))
+    torch.manual_seed(seed)
+    random.seed(seed)
 
     out_dir = resolve_repo_path(cfg.runtime.out_dir)
     additional_files = maybe_to_container(cfg.env.additional_files)
@@ -376,26 +379,49 @@ def train(cfg: DictConfig) -> None:
 
     # --- Loss & Replay ---
     loss_fn = DiscreteSACLossComputer(agent, gamma=float(cfg.train.gamma))
-    replay  = ReplayBuffer(int(cfg.train.replay_capacity), seed=int(cfg.train.seed))
+    replay  = ReplayBuffer(int(cfg.train.replay_capacity), seed=seed)
 
     # --- W&B ---
     use_wandb = _WANDB_AVAILABLE and bool(cfg.wandb.enabled)
     if use_wandb:
+        run_name = cfg.wandb.run_name
+        if not run_name:
+            run_name = f"gat_{optimizer_name}_{reward_mode}_seed{seed}"
         wandb.init(
             project=str(cfg.wandb.project),
-            name=cfg.wandb.run_name,
+            name=str(run_name),
             config=OmegaConf.to_container(cfg, resolve=True),
             dir=str(out_dir),
-            tags=["gat", "discrete-sac", "marl", "sumo-5x5"],
+            tags=["gat", "discrete-sac", "marl", "sumo-5x5", optimizer_name, reward_mode],
         )
         wandb.define_metric("episode")
-        wandb.define_metric("*", step_metric="episode")
+        wandb.define_metric("train/*", step_metric="episode")
+        wandb.define_metric("debug/*", step_metric="episode")
+
+        run_metadata = {
+            "device": str(device),
+            "n_agents": n_agents,
+            "obs_dim": obs_dim,
+            "num_actions": num_actions,
+            "graph_edges": n_edges,
+            "optimizer": optimizer_name,
+            "reward_mode": reward_mode,
+        }
+        wandb.config.update({"run_metadata": run_metadata}, allow_val_change=True)
+        wandb.run.summary["run_name"] = str(run_name)
+        wandb.run.summary["optimizer"] = optimizer_name
+        wandb.run.summary["reward_mode"] = reward_mode
+        wandb.run.summary["n_agents"] = n_agents
+        wandb.run.summary["obs_dim"] = obs_dim
+        wandb.run.summary["num_actions"] = num_actions
+        wandb.run.summary["graph_edges"] = n_edges
 
     # --- Logging ---
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.csv"
     fieldnames = [
         "episode", "n_steps", "return", "return_ma50",
+        "return_per_agent_step",
         "critic_loss", "actor_loss", "alpha_loss",
         "q1", "q2", "entropy", "alpha",
         "total_transitions", "elapsed_s",
@@ -425,6 +451,7 @@ def train(cfg: DictConfig) -> None:
 
         return_history.append(ep_return)
         ma50 = sum(return_history) / len(return_history)
+        return_per_agent_step = ep_return / max(ep_steps * n_agents, 1)
 
         # --- Gradient updates (one per new transition, after warmup) ---
         if total_transitions >= int(cfg.train.warmup):
@@ -446,6 +473,7 @@ def train(cfg: DictConfig) -> None:
             "n_steps":           ep_steps,
             "return":            round(ep_return, 3),
             "return_ma50":       round(ma50, 3),
+            "return_per_agent_step": round(return_per_agent_step, 6),
             "total_transitions": total_transitions,
             "elapsed_s":         round(elapsed, 1),
             **{k: round(float(v), 5) for k, v in last_metrics.items()},
@@ -456,20 +484,22 @@ def train(cfg: DictConfig) -> None:
         # --- W&B ---
         if use_wandb:
             wandb.log({
-                "episode":           ep,
-                "return":            ep_return,
-                "return_ma50":       ma50,
-                "n_steps":           ep_steps,
-                "total_transitions": total_transitions,
-                "elapsed_s":         elapsed,
-                "critic_loss":       last_metrics.get("critic_loss", float("nan")),
-                "actor_loss":        last_metrics.get("actor_loss",  float("nan")),
-                "alpha_loss":        last_metrics.get("alpha_loss",  float("nan")),
-                "q1":                last_metrics.get("q1",          float("nan")),
-                "q2":                last_metrics.get("q2",          float("nan")),
-                "entropy":           last_metrics.get("entropy",     float("nan")),
-                "alpha":             last_metrics.get("alpha",       float("nan")),
-                "best_return":       best_return,
+                # Preferred descriptive names
+                "train/episode":               ep,
+                "train/episode_return":        ep_return,
+                "train/episode_return_ma50":   ma50,
+                "train/return_per_agent_step": return_per_agent_step,
+                "train/episode_steps":         ep_steps,
+                "train/total_transitions":     total_transitions,
+                "train/elapsed_s":             elapsed,
+                "train/loss_critic":           last_metrics.get("critic_loss", float("nan")),
+                "train/loss_actor":            last_metrics.get("actor_loss",  float("nan")),
+                "train/loss_alpha":            last_metrics.get("alpha_loss",  float("nan")),
+                "train/q1_mean":               last_metrics.get("q1",          float("nan")),
+                "train/q2_mean":               last_metrics.get("q2",          float("nan")),
+                "train/policy_entropy":        last_metrics.get("entropy",     float("nan")),
+                "train/alpha":                 last_metrics.get("alpha",       float("nan")),
+                "train/best_episode_return":   best_return,
             }, step=ep)
 
         # --- Console ---

@@ -8,13 +8,13 @@ from marl_env.reward import IntersectionMetrics, RewardCalculator
 def test_queue_reward() -> None:
     calc = RewardCalculator(mode="queue")
     metrics = IntersectionMetrics(queue_lengths=[1, 2, 3])
-    assert calc.compute(metrics) == -6
+    assert calc.compute(metrics) == -2
 
 
 def test_wait_reward() -> None:
     calc = RewardCalculator(mode="wait")
     metrics = IntersectionMetrics(waiting_times=[2.0, 3.0])
-    assert calc.compute(metrics) == -5.0
+    assert calc.compute(metrics) == -2.5
 
 
 def test_combined_reward_finite() -> None:

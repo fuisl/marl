@@ -75,23 +75,31 @@ class RewardCalculator:
     # Reward components
     # ------------------------------------------------------------------
     @staticmethod
+    def _lane_count(m: IntersectionMetrics) -> int:
+        return max(len(m.queue_lengths), len(m.waiting_times), 1)
+
+    @staticmethod
     def _queue_reward(m: IntersectionMetrics) -> float:
-        return -sum(m.queue_lengths)
+        lane_count = RewardCalculator._lane_count(m)
+        return -sum(m.queue_lengths) / lane_count
 
     @staticmethod
     def _wait_reward(m: IntersectionMetrics) -> float:
-        return -sum(m.waiting_times)
+        lane_count = RewardCalculator._lane_count(m)
+        return -sum(m.waiting_times) / lane_count
 
     @staticmethod
     def _pressure_reward(m: IntersectionMetrics) -> float:
         # Pressure = |incoming_queue - outgoing_queue|
         # Simplified: negative total queue as proxy
-        return -sum(m.queue_lengths)
+        lane_count = RewardCalculator._lane_count(m)
+        return -sum(m.queue_lengths) / lane_count
 
     def _combined_reward(self, m: IntersectionMetrics) -> float:
         w = self.weights
-        queue_term = w.get("queue", 0.0) * sum(m.queue_lengths)
-        wait_term = w.get("wait", 0.0) * sum(m.waiting_times)
+        lane_count = self._lane_count(m)
+        queue_term = w.get("queue", 0.0) * (sum(m.queue_lengths) / lane_count)
+        wait_term = w.get("wait", 0.0) * (sum(m.waiting_times) / lane_count)
         speed_term = (
             w.get("speed", 0.0) * (sum(m.mean_speeds) / max(len(m.mean_speeds), 1))
         )
