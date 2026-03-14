@@ -105,6 +105,11 @@ class TrafficSignalEnv:
         self._all_red_phase_map: dict[str, dict[tuple[int, int], int]] = {}
         self._max_lanes: int = 0
         self._max_green: int = 0
+        self._last_interval_flow: dict[str, float] = {
+            "arrived_vehicles": 0.0,
+            "departed_vehicles": 0.0,
+            "teleported_vehicles": 0.0,
+        }
 
     # ==================================================================
     # Core gym-like interface
@@ -181,9 +186,21 @@ class TrafficSignalEnv:
             self._maybe_apply_action(tl_id, target_green)
 
         # --- Advance simulation by delta_t seconds ---
+        arrived_total = 0.0
+        departed_total = 0.0
+        teleported_total = 0.0
         for _ in range(self.delta_t):
             self.adapter.simulation_step()
             self._sync_phase_state_from_sumo()
+            arrived_total += float(self.adapter.get_arrived_number())
+            departed_total += float(self.adapter.get_departed_number())
+            teleported_total += float(self.adapter.get_teleported_number())
+
+        self._last_interval_flow = {
+            "arrived_vehicles": arrived_total,
+            "departed_vehicles": departed_total,
+            "teleported_vehicles": teleported_total,
+        }
 
         # --- Build output ---
         td = self._build_tensordict()
@@ -204,6 +221,37 @@ class TrafficSignalEnv:
 
     def close(self) -> None:
         self.adapter.close()
+
+    def get_interval_kpis(self) -> dict[str, float]:
+        """Return network-level KPIs for the latest decision interval."""
+        lane_ids: set[str] = set()
+        for lanes in self._controlled_lanes.values():
+            lane_ids.update(lanes)
+
+        if not lane_ids:
+            return {
+                "avg_waiting_time_s": 0.0,
+                "avg_queue_halting": 0.0,
+                "avg_speed_mps": 0.0,
+                "avg_occupancy_pct": 0.0,
+                "min_expected_vehicles": float(self.adapter.min_expected_vehicles),
+                **self._last_interval_flow,
+            }
+
+        lane_count = float(len(lane_ids))
+        avg_waiting = sum(self.adapter.get_lane_waiting_time(l) for l in lane_ids) / lane_count
+        avg_queue = sum(self.adapter.get_lane_halting_number(l) for l in lane_ids) / lane_count
+        avg_speed = sum(self.adapter.get_lane_mean_speed(l) for l in lane_ids) / lane_count
+        avg_occupancy = sum(self.adapter.get_lane_occupancy(l) for l in lane_ids) / lane_count
+
+        return {
+            "avg_waiting_time_s": float(avg_waiting),
+            "avg_queue_halting": float(avg_queue),
+            "avg_speed_mps": float(avg_speed),
+            "avg_occupancy_pct": float(avg_occupancy),
+            "min_expected_vehicles": float(self.adapter.min_expected_vehicles),
+            **self._last_interval_flow,
+        }
 
     # ==================================================================
     # Observation helpers

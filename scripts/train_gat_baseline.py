@@ -214,7 +214,7 @@ def run_episode(
     device: torch.device,
     *,
     deterministic: bool = False,
-) -> tuple[list[TensorDict], float, int]:
+) -> tuple[list[TensorDict], float, int, dict[str, float]]:
     """Run one full episode.
 
     Returns
@@ -225,10 +225,26 @@ def run_episode(
         Sum of all agent rewards over the episode.
     n_steps : int
         Number of RL decision steps taken.
+    validation_metrics : dict[str, float]
+        Episode-aggregated network-level KPIs.
     """
     td = env.reset().to(device)
     transitions: list[TensorDict] = []
     total_reward = 0.0
+    avg_metric_keys = (
+        "avg_waiting_time_s",
+        "avg_queue_halting",
+        "avg_speed_mps",
+        "avg_occupancy_pct",
+        "min_expected_vehicles",
+    )
+    total_metric_keys = (
+        "arrived_vehicles",
+        "departed_vehicles",
+        "teleported_vehicles",
+    )
+    metric_sums: dict[str, float] = {k: 0.0 for k in avg_metric_keys + total_metric_keys}
+    n_decisions = 0
 
     while True:
         obs = td["agents", "observation"]
@@ -242,12 +258,26 @@ def run_episode(
         transitions.append(pack_transition(td.cpu(), actions.cpu(), next_td.cpu()))
 
         total_reward += float(next_td["agents", "reward"].sum().item())
+        interval_kpis = env.get_interval_kpis()
+        for key in avg_metric_keys + total_metric_keys:
+            metric_sums[key] += float(interval_kpis.get(key, 0.0))
+        n_decisions += 1
 
         if next_td["done"].item():
             break
         td = next_td
 
-    return transitions, total_reward, len(transitions)
+    validation_metrics = {
+        "avg_waiting_time_s": metric_sums["avg_waiting_time_s"] / max(n_decisions, 1),
+        "avg_queue_halting": metric_sums["avg_queue_halting"] / max(n_decisions, 1),
+        "avg_speed_mps": metric_sums["avg_speed_mps"] / max(n_decisions, 1),
+        "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(n_decisions, 1),
+        "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(n_decisions, 1),
+        "total_arrived_vehicles": metric_sums["arrived_vehicles"],
+        "total_departed_vehicles": metric_sums["departed_vehicles"],
+        "total_teleported_vehicles": metric_sums["teleported_vehicles"],
+    }
+    return transitions, total_reward, len(transitions), validation_metrics
 
 
 # ======================================================================
@@ -407,6 +437,7 @@ def train(cfg: DictConfig) -> None:
         )
         wandb.define_metric("train/episode")
         wandb.define_metric("train/*", step_metric="train/episode")
+        wandb.define_metric("validation/*", step_metric="train/episode")
         wandb.define_metric("debug/*", step_metric="train/episode")
 
         run_metadata = {
@@ -437,6 +468,11 @@ def train(cfg: DictConfig) -> None:
     fieldnames = [
         "episode", "n_steps", "return", "return_ma50",
         "return_per_agent_step",
+        "val_avg_waiting_time_s", "val_avg_queue_halting",
+        "val_avg_speed_mps", "val_avg_occupancy_pct",
+        "val_avg_min_expected_vehicles",
+        "val_total_arrived_vehicles", "val_total_departed_vehicles",
+        "val_total_teleported_vehicles",
         "critic_loss", "actor_loss", "alpha_loss",
         "q1", "q2", "entropy", "alpha",
         "total_transitions", "elapsed_s",
@@ -458,7 +494,7 @@ def train(cfg: DictConfig) -> None:
 
     for ep in range(1, int(cfg.train.episodes) + 1):
         agent.train()
-        transitions, ep_return, ep_steps = run_episode(env, agent, device)
+        transitions, ep_return, ep_steps, validation_metrics = run_episode(env, agent, device)
 
         for t in transitions:
             replay.push(t)
@@ -489,6 +525,14 @@ def train(cfg: DictConfig) -> None:
             "return":            round(ep_return, 3),
             "return_ma50":       round(ma50, 3),
             "return_per_agent_step": round(return_per_agent_step, 6),
+            "val_avg_waiting_time_s": round(validation_metrics["avg_waiting_time_s"], 4),
+            "val_avg_queue_halting": round(validation_metrics["avg_queue_halting"], 4),
+            "val_avg_speed_mps": round(validation_metrics["avg_speed_mps"], 4),
+            "val_avg_occupancy_pct": round(validation_metrics["avg_occupancy_pct"], 4),
+            "val_avg_min_expected_vehicles": round(validation_metrics["avg_min_expected_vehicles"], 4),
+            "val_total_arrived_vehicles": round(validation_metrics["total_arrived_vehicles"], 2),
+            "val_total_departed_vehicles": round(validation_metrics["total_departed_vehicles"], 2),
+            "val_total_teleported_vehicles": round(validation_metrics["total_teleported_vehicles"], 2),
             "total_transitions": total_transitions,
             "elapsed_s":         round(elapsed, 1),
             **{k: round(float(v), 5) for k, v in last_metrics.items()},
@@ -515,6 +559,14 @@ def train(cfg: DictConfig) -> None:
                 "train/policy_entropy":        last_metrics.get("entropy",     float("nan")),
                 "train/alpha":                 last_metrics.get("alpha",       float("nan")),
                 "train/best_episode_return":   best_return,
+                "validation/avg_waiting_time_s": validation_metrics["avg_waiting_time_s"],
+                "validation/avg_queue_halting": validation_metrics["avg_queue_halting"],
+                "validation/avg_speed_mps": validation_metrics["avg_speed_mps"],
+                "validation/avg_occupancy_pct": validation_metrics["avg_occupancy_pct"],
+                "validation/avg_min_expected_vehicles": validation_metrics["avg_min_expected_vehicles"],
+                "validation/total_arrived_vehicles": validation_metrics["total_arrived_vehicles"],
+                "validation/total_departed_vehicles": validation_metrics["total_departed_vehicles"],
+                "validation/total_teleported_vehicles": validation_metrics["total_teleported_vehicles"],
             })
 
         # --- Console ---
