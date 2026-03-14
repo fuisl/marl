@@ -1,0 +1,46 @@
+# Berlin scenario (BeST — Berlin SUMO Traffic)
+# Characteristics:
+#   Nodes:              28 547
+#   Edges:              71 651
+#   TLS junctions:       2 249
+#   Bus stops:           6 246
+#   Car trips:       2 246 917
+#   Bus trips:          25 724
+#   Avg trip duration:    817 s
+#   Avg trip distance:    7.9 km
+#   Mean speed ratio:      0.71 (vs. speed limits)
+#   Total teleports:     2 332
+#   CPU sim time:          ~7 h (3.4 GHz, no GUI)
+#
+# Full simulation span: 0 – 86 400 s (24 h).
+# The window below targets the morning peak (07:00–08:00).
+# Route files follow the berlin.sumocfg convention:
+#   -r  berlin.rou.gz,berlin_bus.rou.xml   (SUMO accepts comma-separated)
+#   -a  berlin_bus_stops.add.xml
+
+net_file: nets/berlin/berlin.net.xml
+
+# Comma-separated route files (cars + buses) — SUMO handles .rou.gz natively.
+route_file: "nets/berlin/berlin.rou.gz,nets/berlin/berlin_bus.rou.xml"
+
+delta_t: 5
+
+# Morning peak hour (07:00–08:00).  Full day: begin_time=0, end_time=86400.
+begin_time: 25200
+end_time: 28800
+
+sumo_binary: sumo
+gui: false
+
+# Bus stop definitions required for bus routes.
+additional_files:
+  - nets/berlin/berlin_bus_stops.add.xml
+
+reward_mode: pressure_queue
+reward_weights:
+  pressure: 1.0
+  queue: 0.1
+
+yellow_duration: 3
+all_red_duration: 2
+min_green_duration: 10

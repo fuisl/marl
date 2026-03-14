@@ -52,7 +52,7 @@ train:
 wandb:
   enabled: true
   project: marl-traffic-gat
-  run_name: gat_meta_critic_seed42
+  run_name: gat_meta_critic
 
 runtime:
   out_dir: runs/gat_baseline_meta_critic

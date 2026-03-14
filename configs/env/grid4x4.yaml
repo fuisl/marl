@@ -1,10 +1,10 @@
-# Cologne3 scenario (SUMO dataset)
-net_file: nets/cologne3/cologne3.net.xml
-route_file: nets/cologne3/cologne3.rou.xml
+# Grid4x4 scenario (SUMO dataset)
+net_file: nets/grid4x4/grid4x4.net.xml
+route_file: nets/grid4x4/grid4x4_1.rou.xml
 
 delta_t: 5
-begin_time: 25200
-end_time: 28800
+begin_time: 0
+end_time: 3600
 
 sumo_binary: sumo
 gui: false
