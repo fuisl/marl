@@ -1,0 +1,20 @@
+defaults:
+  - env: default
+  - model: default
+  - _self_
+
+runtime:
+  checkpoint_path: null
+  out_dir: null
+  device: cpu
+
+analysis:
+  num_snapshots: 5
+  max_hops: null
+  curve_num_samples: null
+  map_num_samples: null
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

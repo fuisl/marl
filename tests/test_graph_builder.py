@@ -29,8 +29,9 @@ class FakeEdge:
 
 
 class FakeNode:
-    def __init__(self, node_id: str) -> None:
+    def __init__(self, node_id: str, *, coord: tuple[float, float] = (0.0, 0.0)) -> None:
         self._id = node_id
+        self._coord = coord
         self._outgoing: list[FakeEdge] = []
         self._incoming: list[FakeEdge] = []
 
@@ -42,6 +43,9 @@ class FakeNode:
 
     def getIncoming(self) -> list[FakeEdge]:
         return self._incoming
+
+    def getCoord(self) -> tuple[float, float]:
+        return self._coord
 
     def add_outgoing(self, edge: FakeEdge) -> None:
         self._outgoing.append(edge)
@@ -113,9 +117,9 @@ def _connect(a: FakeNode, b: FakeNode, length: float, lanes: int) -> FakeEdge:
 
 
 def _build_fake_graph(*, berlin_style_tls_ids: bool) -> tuple[object, list[str]]:
-    n_a = FakeNode("A")
-    n_b = FakeNode("B")
-    n_c = FakeNode("C")
+    n_a = FakeNode("A", coord=(0.0, 0.0))
+    n_b = FakeNode("B", coord=(10.0, 5.0))
+    n_c = FakeNode("C", coord=(20.0, 10.0))
 
     e_ab = _connect(n_a, n_b, 10.0, 2)
     e_ba = _connect(n_b, n_a, 11.0, 1)
@@ -182,4 +186,43 @@ def test_build_graph_falls_back_to_node_ids_without_tls_api(monkeypatch: object)
             [[10.0, 2.0], [11.0, 1.0], [20.0, 3.0], [21.0, 1.0]],
             dtype=torch.float32,
         ),
+    )
+
+
+def test_node_positions_align_with_tls_ids(monkeypatch: object) -> None:
+    fake_net, tl_ids = _build_fake_graph(berlin_style_tls_ids=False)
+    _patch_sumolib(monkeypatch, fake_net)
+
+    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=tl_ids)
+
+    assert torch.allclose(
+        builder.node_positions,
+        torch.tensor(
+            [[0.0, 0.0], [10.0, 5.0], [20.0, 10.0]],
+            dtype=torch.float32,
+        ),
+    )
+
+
+def test_node_positions_use_centroid_for_controller_tls(monkeypatch: object) -> None:
+    n_a = FakeNode("A", coord=(0.0, 0.0))
+    n_b = FakeNode("B", coord=(20.0, 10.0))
+    n_c = FakeNode("C", coord=(40.0, 0.0))
+
+    e_ab = _connect(n_a, n_b, 10.0, 1)
+    e_cb = _connect(n_c, n_b, 12.0, 1)
+
+    fake_net = FakeNet(
+        nodes={"A": n_a, "B": n_b, "C": n_c},
+        tls_list=[
+            FakeTLS("GS_BC", [[FakeLane(e_ab), FakeLane(e_cb), 0]]),
+        ],
+    )
+    _patch_sumolib(monkeypatch, fake_net)
+
+    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=["GS_BC"])
+
+    assert torch.allclose(
+        builder.node_positions,
+        torch.tensor([[30.0, 5.0]], dtype=torch.float32),
     )

@@ -39,6 +39,7 @@ class GraphBuilder:
 
         self._edge_index: Tensor | None = None
         self._edge_attr: Tensor | None = None
+        self._node_positions: Tensor | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -96,6 +97,18 @@ class GraphBuilder:
     @property
     def num_nodes(self) -> int:
         return len(self.tl_ids)
+
+    @property
+    def node_positions(self) -> Tensor:
+        """Return ordered TLS/controller positions as ``[num_nodes, 2]``.
+
+        Positions align with ``self.tl_ids``. For controller-style TLS IDs,
+        the position is the centroid of the controlled SUMO node coordinates.
+        """
+        if self._node_positions is None:
+            coords = [self._get_position_for_tls(tl_id) for tl_id in self.tl_ids]
+            self._node_positions = torch.tensor(coords, dtype=torch.float32)
+        return self._node_positions
 
     # ------------------------------------------------------------------
     # Internals
@@ -212,3 +225,30 @@ class GraphBuilder:
                 if node_id not in node_to_tls_id:
                     node_to_tls_id[node_id] = tls_id
         return node_to_tls_id
+
+    @staticmethod
+    def _centroid(nodes: list[Any]) -> tuple[float, float]:
+        if not nodes:
+            return float("nan"), float("nan")
+
+        xs: list[float] = []
+        ys: list[float] = []
+        for node in nodes:
+            x, y = node.getCoord()
+            xs.append(float(x))
+            ys.append(float(y))
+
+        return sum(xs) / len(xs), sum(ys) / len(ys)
+
+    def _get_position_for_tls(self, tl_id: str) -> tuple[float, float]:
+        controlled_nodes = self._tls_nodes_by_id.get(tl_id)
+        if controlled_nodes:
+            return self._centroid(controlled_nodes)
+
+        try:
+            node = self.net.getNode(tl_id)
+        except KeyError:
+            return float("nan"), float("nan")
+
+        x, y = node.getCoord()
+        return float(x), float(y)
