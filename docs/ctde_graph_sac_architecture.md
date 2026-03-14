@@ -348,13 +348,7 @@ Let:
 
 For the next state:
 
-\[
-V(s') =
-\sum_a
-\pi(a \mid s')
-\Big(
-\min(Q_1'(s',a), Q_2'(s',a))
-- \alpha \log \pi(a \mid s')
+\[V(s') =\sum_a\pi(a \mid s')\Big(\min(Q_1'(s',a), Q_2'(s',a)) - \alpha \log \pi(a \mid s')
 \Big)
 \]
 
@@ -368,16 +362,9 @@ y_i = r_i + (1 - d_i)\gamma V_i(s')
 
 ### 8.3 Critic loss
 
-\[
-\mathcal L_Q
-=
-\frac{1}{2}
-\left(
-\|Q_1(s,a) - y\|_2^2
-+
-\|Q_2(s,a) - y\|_2^2
-\right)
-\]
+$$
+\mathcal{L}_Q=\frac{1}{2}\left(\|Q_1(s,a) - y\|_2^2+\|Q_2(s,a) - y\|_2^2\right)
+$$
 
 This matches `DiscreteSACLossComputer._critic_loss(...)`.
 
@@ -385,21 +372,17 @@ This matches `DiscreteSACLossComputer._critic_loss(...)`.
 
 The actor minimizes:
 
-\[
-\mathcal L_\pi
-=
-\mathbb E_s
+$$
+\mathcal{L}_{\pi}=\mathbb{E}_{s}
 \left[
 \frac{1}{N_a}
 \sum_{i=1}^{N_a}
-\sum_a
+\sum_{a}
 \pi_i(a \mid s)
 \Big(
-\alpha \log \pi_i(a \mid s)
-- \min(Q_{1,i}(s,a), Q_{2,i}(s,a))
+\alpha \log \pi_i(a \mid s) - \min\left(Q_{1,i}(s,a), Q_{2,i}(s,a)\right)
 \Big)
-\right]
-\]
+\right]$$
 
 This is the exact expectation form used by Discrete SAC in the code.
 
@@ -407,17 +390,15 @@ This is the exact expectation form used by Discrete SAC in the code.
 
 The implementation uses:
 
-\[
-\mathcal L_\alpha
-=
-- \log \alpha \, \big(\mathcal H(\pi) - \mathcal H_{\text{target}}\big)
-\]
+$$
+\mathcal{L}_{\alpha}=- \log \alpha \, \big(\mathcal{H}(\pi) - \mathcal{H}_{\text{target}}\big)
+$$
 
 with target entropy heuristic:
 
-\[
-\mathcal H_{\text{target}} = -0.98 |\mathcal A|
-\]
+$$
+\mathcal{H}_{\text{target}} = -0.98\,|\mathcal{A}|
+$$
 
 ## 9. Batched Graph Encoding Trick
 
