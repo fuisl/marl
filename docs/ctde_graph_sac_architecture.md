@@ -53,16 +53,16 @@ $$
 
 where:
 
-- \(q_i\): padded halting counts on lanes
-- \(w_i\): padded waiting times
-- \(o_i\): padded occupancies
-- \(s_i\): padded mean speeds
-- \(p_i\): one-hot encoding of the current controllable green phase
-- \(\tau_i\): elapsed time in the current green
+- $$\(q_i\)$$: padded halting counts on lanes
+- $$\(w_i\)$$: padded waiting times
+- $$\(o_i\)$$: padded occupancies
+- $$\(s_i\)$$: padded mean speeds
+- $$\(p_i\)$$: one-hot encoding of the current controllable green phase
+- $$\(\tau_i\)$$: elapsed time in the current green
 
 In code, this comes from `TrafficSignalEnv._build_observation_from_lanes_and_phase(...)`.
 
-For a lane set \(\mathcal L(i)\), the padded traffic blocks are:
+For a lane set $$\(\mathcal L(i)\)$$, the padded traffic blocks are:
 
 $$
 \[
@@ -152,7 +152,7 @@ d_{ij} = \min_{\rho:i \leadsto j} \sum_{(u,v)\in \rho} \mathrm{len}(u,v)
 \]
 $$
 
-where \(\rho^\star\) is the selected shortest path.
+where $$\(\rho^\star\)$$ is the selected shortest path.
 
 ### `all_intersections`
 
@@ -185,8 +185,8 @@ $$
 
 where:
 
-- \(d_{ij}\) is road distance
-- \(\ell_{ij}\) is number of connecting lanes, or a bottleneck lane count in `walk_to_light`
+- $$\(d_{ij}\)$$ is road distance
+- $$\(\ell_{ij}\)$$ is number of connecting lanes, or a bottleneck lane count in `walk_to_light`
 
 These are passed into PyG `GATv2Conv(edge_dim=2)`.
 
@@ -219,10 +219,10 @@ $$
 
 where:
 
-- \(\mathcal N(i)\) is the graph neighborhood of node \(i\)
-- \(\alpha_{ij}^{(\ell)}\) is attention weight from `GATv2Conv`
-- \(\phi^{(\ell)}\) and \(\psi^{(\ell)}\) are the learned GATv2 transformations
-- \(\bigoplus\) denotes attention-weighted aggregation
+- $$\(\mathcal N(i)\)$$ is the graph neighborhood of node $$\(i\)$$
+- $$\(\alpha_{ij}^{(\ell)}\)$$ is attention weight from `GATv2Conv`
+- $$\(\phi^{(\ell)}\)$$ and $$\(\psi^{(\ell)}\)$$ are the learned GATv2 transformations
+- $$\(\bigoplus\)$$ denotes attention-weighted aggregation
 
 ### 4.2 Exact repository structure
 
@@ -243,13 +243,13 @@ z = W_{\text{out}} h^{(2)}
 \]
 $$
 
-So each node gets a latent embedding \(z_i \in \mathbb R^{d_z}\).
+So each node gets a latent embedding $$\(z_i \in \mathbb R^{d_z}\)$$.
 
 ### 4.3 What happens in `all_intersections`
 
 If graph nodes are not the same as RL agents, the code pools node embeddings back to each RL agent.
 
-If agent \(m\) is attached to node set \(S_m \subseteq V\), then:
+If agent $$\(m\)$$ is attached to node set $$\(S_m \subseteq V\)$$, then:
 
 $$
 \[
@@ -271,7 +271,7 @@ $$
 \]
 $$
 
-where \(\ell_i \in \mathbb R^{|\mathcal A|}\) is the logits vector over discrete green-phase actions.
+where $$\(\ell_i \in \mathbb R^{|\mathcal A|}\)$$ is the logits vector over discrete green-phase actions.
 
 The current code is:
 
@@ -284,7 +284,7 @@ $$
 
 ### 5.1 Action masking
 
-The environment computes a legal action mask \(m_i(a) \in \{0,1\}\) using:
+The environment computes a legal action mask $$\(m_i(a) \in \{0,1\}\)$$ using:
 
 - minimum green duration
 - whether the signal is currently in a transitional phase
@@ -351,7 +351,7 @@ $$
 
 to reduce positive bias, and each is a 3-layer MLP.
 
-This is centralized because the pooled context \(c\) depends on the whole multi-agent state, not only agent \(i\).
+This is centralized because the pooled context $$\(c\)$$ depends on the whole multi-agent state, not only agent $$\(i\)$$.
 
 ## 7. Why This Counts As CTDE Here
 
@@ -372,7 +372,7 @@ The implementation follows CTDE in this specific sense:
 
 ### Nuance
 
-The actor latent \(z_i\) is not built from \(x_i\) alone.
+The actor latent $$\(z_i\)$$ is not built from $$\(x_i\)$$ alone.
 It comes from graph message passing over the current graph observation.
 So the execution policy is decentralized in output structure, but not strictly local-information-only.
 
@@ -382,9 +382,9 @@ That nuance is important if you compare this code to stricter Dec-POMDP formulat
 
 Let:
 
-- \(r_i\) be the per-agent reward from the environment
-- \(d_i\) be the done flag
-- \(\alpha = \exp(\log \alpha)\) be the entropy temperature
+- $$\(r_i\)$$ be the per-agent reward from the environment
+- $$\(d_i\)$$ be the done flag
+- $$\(\alpha = \exp(\log \alpha)\)$$ be the entropy temperature
 
 ### 8.1 Target state value
 
@@ -451,7 +451,7 @@ $$
 PyG expects one graph at a time, but replay produces a batch of transitions.
 
 So the implementation builds one block-diagonal super-graph:
-
+$$
 \[
 \tilde X =
 \begin{bmatrix}
@@ -461,9 +461,10 @@ X^{(2)} \\
 X^{(B)}
 \end{bmatrix}
 \]
+$$
 
 and shifts the edge indices by graph offset:
-
+$$
 \[
 \tilde E =
 \{
@@ -473,11 +474,11 @@ and shifts the edge indices by graph offset:
 b=0,\dots,B-1
 \}
 \]
-
+$$
 where:
 
-- \(B\): replay batch size
-- \(N_g\): number of graph nodes in one environment state
+- $$\(B\)$$: replay batch size
+- $$\(N_g\)$$: number of graph nodes in one environment state
 
 This is exactly what `_batch_edge_index(...)` in `rl/losses.py` does.
 
