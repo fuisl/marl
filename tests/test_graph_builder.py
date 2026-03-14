@@ -159,12 +159,12 @@ def test_build_graph_from_berlin_style_tls_ids(monkeypatch: object) -> None:
     assert builder.num_nodes == 3
     assert edge_attr is not None
 
-    # Expected directed edges: A->B, B->A, B->C, C->B
+    # Distances use the shortest undirected road segment between controllers.
     assert edge_index.tolist() == [[0, 1, 1, 2], [1, 0, 2, 1]]
     assert torch.allclose(
         edge_attr,
         torch.tensor(
-            [[10.0, 2.0], [11.0, 1.0], [20.0, 3.0], [21.0, 1.0]],
+            [[10.0, 2.0], [10.0, 2.0], [20.0, 3.0], [20.0, 3.0]],
             dtype=torch.float32,
         ),
     )
@@ -183,7 +183,7 @@ def test_build_graph_falls_back_to_node_ids_without_tls_api(monkeypatch: object)
     assert torch.allclose(
         edge_attr,
         torch.tensor(
-            [[10.0, 2.0], [11.0, 1.0], [20.0, 3.0], [21.0, 1.0]],
+            [[10.0, 2.0], [10.0, 2.0], [20.0, 3.0], [20.0, 3.0]],
             dtype=torch.float32,
         ),
     )
@@ -225,4 +225,37 @@ def test_node_positions_use_centroid_for_controller_tls(monkeypatch: object) -> 
     assert torch.allclose(
         builder.node_positions,
         torch.tensor([[30.0, 5.0]], dtype=torch.float32),
+    )
+
+
+def test_build_graph_connects_tls_through_unsignalized_nodes(monkeypatch: object) -> None:
+    n_a = FakeNode("A", coord=(0.0, 0.0))
+    n_x = FakeNode("X", coord=(5.0, 0.0))
+    n_b = FakeNode("B", coord=(10.0, 0.0))
+
+    e_ax = _connect(n_a, n_x, 5.0, 3)
+    e_xa = _connect(n_x, n_a, 7.0, 2)
+    e_xb = _connect(n_x, n_b, 11.0, 1)
+    e_bx = _connect(n_b, n_x, 13.0, 4)
+
+    fake_net = FakeNet(
+        nodes={"A": n_a, "X": n_x, "B": n_b},
+        tls_list=[
+            FakeTLS("GS_A", [[FakeLane(e_xa), FakeLane(e_ax), 0]]),
+            FakeTLS("GS_B", [[FakeLane(e_xb), FakeLane(e_bx), 0]]),
+        ],
+    )
+    _patch_sumolib(monkeypatch, fake_net)
+
+    builder = GraphBuilder(net_file="unused.net.xml", tl_ids=["GS_A", "GS_B"])
+    edge_index, edge_attr = builder.build()
+
+    assert edge_attr is not None
+    assert edge_index.tolist() == [[0, 1], [1, 0]]
+    assert torch.allclose(
+        edge_attr,
+        torch.tensor(
+            [[16.0, 1.0], [16.0, 1.0]],
+            dtype=torch.float32,
+        ),
     )

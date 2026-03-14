@@ -6,6 +6,7 @@ Node features change every step; topology does not.
 
 from __future__ import annotations
 
+import heapq
 from typing import Any
 
 import torch
@@ -21,7 +22,9 @@ class GraphBuilder:
     """Builds a homogeneous intersection graph from a SUMO ``.net.xml``.
 
     Nodes  = controlled traffic-light intersections.
-    Edges  = pairs of intersections connected by at least one road segment.
+    Edges  = pairs of intersections connected by road segments, allowing
+    traversal through intermediate non-signalized SUMO nodes until the next
+    controlled intersection is reached.
 
     Optional edge attributes include distance between intersections and
     the number of connecting lanes.
@@ -117,36 +120,7 @@ class GraphBuilder:
         self, node: Any
     ) -> list[tuple[str, float, int]]:
         """Return ``(neighbor_tl_id, distance, n_lanes)`` for neighbours."""
-        neighbors: list[tuple[str, float, int]] = []
-        seen: set[str] = set()
-
-        for edge in node.getOutgoing():
-            to_node = edge.getToNode()
-            nbr_id = to_node.getID()
-            if nbr_id in seen or nbr_id == node.getID():
-                continue
-            if nbr_id not in self._id_to_idx:
-                continue
-            seen.add(nbr_id)
-
-            dist = edge.getLength()
-            n_lanes = edge.getLaneNumber()
-            neighbors.append((nbr_id, dist, n_lanes))
-
-        for edge in node.getIncoming():
-            from_node = edge.getFromNode()
-            nbr_id = from_node.getID()
-            if nbr_id in seen or nbr_id == node.getID():
-                continue
-            if nbr_id not in self._id_to_idx:
-                continue
-            seen.add(nbr_id)
-
-            dist = edge.getLength()
-            n_lanes = edge.getLaneNumber()
-            neighbors.append((nbr_id, dist, n_lanes))
-
-        return neighbors
+        return self._find_neighbor_tls(source_tl_id=node.getID(), start_nodes=[node])
 
     def _get_neighbor_tl_ids_for_tls(self, tl_id: str) -> list[tuple[str, float, int]]:
         """Return ``(neighbor_tl_id, distance, n_lanes)`` for a TLS controller.
@@ -157,29 +131,10 @@ class GraphBuilder:
         """
         controlled_nodes = self._tls_nodes_by_id.get(tl_id)
         if controlled_nodes:
-            neighbors: list[tuple[str, float, int]] = []
-            seen: set[str] = set()
-            for node in controlled_nodes:
-                for edge in node.getOutgoing():
-                    to_node = edge.getToNode()
-                    nbr_id = self._node_to_tls_id.get(to_node.getID())
-                    if nbr_id is None or nbr_id == tl_id or nbr_id in seen:
-                        continue
-                    if nbr_id not in self._id_to_idx:
-                        continue
-                    seen.add(nbr_id)
-                    neighbors.append((nbr_id, edge.getLength(), edge.getLaneNumber()))
-
-                for edge in node.getIncoming():
-                    from_node = edge.getFromNode()
-                    nbr_id = self._node_to_tls_id.get(from_node.getID())
-                    if nbr_id is None or nbr_id == tl_id or nbr_id in seen:
-                        continue
-                    if nbr_id not in self._id_to_idx:
-                        continue
-                    seen.add(nbr_id)
-                    neighbors.append((nbr_id, edge.getLength(), edge.getLaneNumber()))
-            return neighbors
+            return self._find_neighbor_tls(
+                source_tl_id=tl_id,
+                start_nodes=controlled_nodes,
+            )
 
         # Fallback for scenarios where TLS IDs equal node IDs.
         try:
@@ -187,6 +142,85 @@ class GraphBuilder:
         except KeyError:
             return []
         return self._get_neighbor_tl_ids(node)
+
+    @staticmethod
+    def _iter_neighbor_nodes(node: Any) -> list[tuple[Any, float, int]]:
+        """Return adjacent SUMO nodes with edge distance and lane count."""
+        neighbors: list[tuple[Any, float, int]] = []
+
+        for edge in node.getOutgoing():
+            to_node = edge.getToNode()
+            if to_node.getID() == node.getID():
+                continue
+            neighbors.append((to_node, float(edge.getLength()), int(edge.getLaneNumber())))
+
+        for edge in node.getIncoming():
+            from_node = edge.getFromNode()
+            if from_node.getID() == node.getID():
+                continue
+            neighbors.append((from_node, float(edge.getLength()), int(edge.getLaneNumber())))
+
+        return neighbors
+
+    def _find_neighbor_tls(
+        self,
+        source_tl_id: str,
+        start_nodes: list[Any],
+    ) -> list[tuple[str, float, int]]:
+        """Walk through non-TLS nodes until the next controlled TLS is found.
+
+        The returned lane count is the minimum lane count along the selected
+        shortest path, which acts as a simple bottleneck estimate.
+        """
+        if not start_nodes:
+            return []
+
+        heap: list[tuple[float, float, str, Any]] = []
+        best_node_distance: dict[str, float] = {}
+        best_terminal: dict[str, tuple[float, int]] = {}
+
+        for node in start_nodes:
+            node_id = node.getID()
+            best_node_distance[node_id] = 0.0
+            heapq.heappush(heap, (0.0, float("inf"), node_id, node))
+
+        while heap:
+            dist, bottleneck_lanes, node_id, node = heapq.heappop(heap)
+            if dist > best_node_distance.get(node_id, float("inf")):
+                continue
+
+            terminal_tl_id = self._node_to_tls_id.get(node_id)
+            if terminal_tl_id is None and node_id in self._id_to_idx:
+                terminal_tl_id = node_id
+            if terminal_tl_id is not None and terminal_tl_id != source_tl_id:
+                lane_count = 0 if bottleneck_lanes == float("inf") else int(bottleneck_lanes)
+                prev = best_terminal.get(terminal_tl_id)
+                if prev is None or dist < prev[0] or (
+                    dist == prev[0] and lane_count > prev[1]
+                ):
+                    best_terminal[terminal_tl_id] = (dist, lane_count)
+                continue
+
+            for next_node, edge_dist, edge_lanes in self._iter_neighbor_nodes(node):
+                next_id = next_node.getID()
+                next_dist = dist + edge_dist
+                prev_best = best_node_distance.get(next_id)
+                if prev_best is not None and next_dist >= prev_best:
+                    continue
+
+                best_node_distance[next_id] = next_dist
+                next_bottleneck = (
+                    float(edge_lanes)
+                    if bottleneck_lanes == float("inf")
+                    else min(bottleneck_lanes, float(edge_lanes))
+                )
+                heapq.heappush(heap, (next_dist, next_bottleneck, next_id, next_node))
+
+        return [
+            (tl_id, distance, lane_count)
+            for tl_id, (distance, lane_count) in best_terminal.items()
+            if tl_id in self._id_to_idx
+        ]
 
     def _build_tls_node_map(self) -> dict[str, list[Any]]:
         """Map TLS/controller ID -> list of controlled SUMO nodes."""
