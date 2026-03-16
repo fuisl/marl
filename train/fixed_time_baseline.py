@@ -2,27 +2,11 @@
 
 Collects the same traffic metrics that the RL agent will be evaluated on,
 so you have a fair comparison baseline.
-
-Usage::
-
-    python scripts/run_sumo_baseline.py
-
-    # Override any env key at the command line:
-    python scripts/run_sumo_baseline.py env.end_time=1800 env.gui=true
 """
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-import hydra
-from omegaconf import DictConfig
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(REPO_ROOT))
-
-from config_utils import load_dotenv, maybe_to_container
+from config_utils import load_dotenv
 
 from marl_env.sumo_env import TrafficSignalEnv
 
@@ -71,12 +55,3 @@ def run_baseline(env_cfg: dict) -> dict[str, float]:
 
     return metrics
 
-
-@hydra.main(version_base=None, config_path="../configs", config_name="sumo_baseline")
-def main(cfg: DictConfig) -> None:
-    env_cfg = maybe_to_container(cfg.env)
-    run_baseline(env_cfg)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,8 +1,0 @@
-defaults:
-  - env: default
-  - _self_
-
-hydra:
-  run:
-    dir: .
-  output_subdir: null

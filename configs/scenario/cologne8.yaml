@@ -1,0 +1,8 @@
+name: cologne8
+
+env_params:
+  net_file: nets/cologne8/cologne8.net.xml
+  route_file: nets/cologne8/cologne8.rou.xml
+  begin_time: 25200
+  end_time: 28800
+  delta_t: 5

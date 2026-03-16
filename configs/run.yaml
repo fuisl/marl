@@ -1,0 +1,22 @@
+defaults:
+  - env: sumo
+  - scenario: grid5x5
+  - algo: discrete_sac
+  - model: default
+  - train: default
+  - logger: default
+  - runtime: default
+  - optional experiment: null
+  - override hydra/launcher: joblib
+  - _self_
+
+project: marl-traffic-gat
+seed: 21
+run_name: ${algo.name}_${scenario.name}_seed${seed}
+
+tags: []
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

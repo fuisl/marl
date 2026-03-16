@@ -1,0 +1,5 @@
+wandb:
+  enabled: true
+  project: marl-traffic-gat
+  run_name: ${run_name}
+  log_model: false

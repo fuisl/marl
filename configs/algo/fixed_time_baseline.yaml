@@ -1,0 +1,7 @@
+name: fixed_time_baseline
+trainer: fixed_time_baseline
+kind: baseline
+
+supports:
+  action_space: [discrete]
+  obs_space: [graph, vector]

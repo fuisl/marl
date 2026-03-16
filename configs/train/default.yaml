@@ -1,0 +1,43 @@
+episodes: 300
+gamma: 0.90
+batch_size: 64
+replay_capacity: 100000
+warmup: 5000
+updates_per_step: 1
+log_interval: 1
+
+optimizer:
+  name: adam
+  lr: 3.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  amsgrad: false
+  meta:
+    hyper_lr: 1.0e-7
+    min_lr: 1.0e-6
+    max_lr: 1.0e-2
+
+optimizer_actor:
+  name: adam
+  lr: 1.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  amsgrad: false
+
+optimizer_critic:
+  name: adam
+  lr: 3.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  amsgrad: false
+
+optimizer_alpha:
+  name: adam
+  lr: 3.0e-4
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  weight_decay: 0.0
+  amsgrad: false

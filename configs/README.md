@@ -1,153 +1,179 @@
 # configs/
 
-Hydra configuration directory. All training and evaluation entrypoints are driven by configs here — no argparse, no hardcoded paths.
+Hydra configuration directory with a compositional layout for MARL research:
 
----
+- `env` for environment family invariants
+- `scenario` for task/map-specific settings
+- `algo` for trainer/algorithm identity
+- `model` for architecture
+- `train` for optimization budgets
+- `experiment` for named presets
+
+## Recommended run entrypoint
+
+Use the centralized runner:
+
+```bash
+python scripts/run_experiment.py
+```
+
+This keeps one command surface for Discrete SAC training and fixed-time baseline runs.
 
 ## Structure
 
-```
+```text
 configs/
-├── env/
-│   └── default.yaml        # SUMO environment settings (config group)
-├── model/
-│   └── default.yaml        # Neural network architecture (config group)
-├── train/
-│   └── lightning.yaml      # Lightning training hyperparameters (config group)
-│
-├── gat_baseline.yaml       # ← Entrypoint: scripts/train_gat_baseline.py
-├── lightning_train.yaml    # ← Entrypoint: train/train.py
-├── sumo_baseline.yaml      # ← Entrypoint: scripts/run_sumo_baseline.py
-└── evaluate.yaml           # ← Entrypoint: train/evaluate.py
+    run.yaml                     # top-level compositional config
+    env/
+        sumo.yaml                  # environment family defaults
+        ...                        # legacy env files kept for compatibility
+    scenario/
+        grid5x5.yaml
+        grid4x4.yaml
+        arterial4x4.yaml
+        cologne1.yaml
+        cologne3.yaml
+        cologne8.yaml
+        berlin.yaml
+    algo/
+        discrete_sac.yaml
+        fixed_time_baseline.yaml
+    model/
+        default.yaml
+    train/
+        default.yaml
+        ...                        # legacy train files kept for compatibility
+    logger/
+        default.yaml
+    runtime/
+        default.yaml
+    experiment/
+        grid5x5.yaml
+        cologne8.yaml
+        fixed_time_grid5x5.yaml
 ```
 
----
+## Why this pattern
 
-## Config groups (`env/`, `model/`, `train/`)
+The key design rule is separating what changes independently:
 
-Shared, reusable config blocks consumed by the entrypoint configs via Hydra `defaults`.
+- `env`: simulator family and common mechanics
+- `scenario`: map, route, time window, and task semantics
+- `algo`: learning method and trainer type
+- `model`: network architecture
+- `train`: run budget and optimization schedule
+- `experiment`: reusable named combinations
 
-| File | What it controls |
-|---|---|
-| `env/default.yaml` | SUMO net/route files, simulation window, reward function, phase constraints |
-| `model/default.yaml` | GATv2Conv encoder dims, actor/critic hidden dims, `init_alpha`, `tau` |
-| `train/lightning.yaml` | Seed, optimizer, SAC hyperparams, training schedule (used by Lightning trainer) |
+This avoids duplicating giant monolithic configs and makes sweeps natural.
 
----
+## Core config fields
 
-## Entrypoint configs
+`run.yaml` composes groups and adds:
 
-### `gat_baseline.yaml` → `scripts/train_gat_baseline.py`
+- `project`: project name for logging
+- `seed`: random seed
+- `run_name`: default run identifier
+- `tags`: experiment labels
 
-Manual SAC training loop (no Lightning). Pulls in `env: default` and `model: default`.
+`env/sumo.yaml` contains shared SUMO defaults:
+
+- `action_space`, `obs_space` for compatibility checks
+- `common.delta_t`, `common.sumo_binary`, `common.gui`
+- reward and phase constraint defaults
+
+`scenario/*.yaml` contains scenario-level overrides only:
+
+- `env_params.net_file`, `env_params.route_file`
+- `env_params.begin_time`, `env_params.end_time`
+- optional per-scenario `delta_t` and `additional_files`
+
+`algo/*.yaml` contains trainer identity and capability constraints:
+
+- `trainer`: `discrete_sac` / `fixed_time_baseline`
+- `supports.action_space`
+
+`train/*.yaml` contains optimization settings:
+
+- default profile: `episodes`, `warmup`, replay and optimizer blocks
+
+`logger/default.yaml` contains W&B configuration:
+
+- `wandb.enabled`, `wandb.project`, `wandb.run_name`, `wandb.log_model`
+
+`runtime/default.yaml` contains runtime infra:
+
+- `out_dir`
+- optional `gui` override
+
+## How to run
+
+`configs/run.yaml` sets multirun launcher to `hydra/launcher=joblib` by default,
+so `-m` sweeps run in parallel.
+
+Default parallel workers are in `configs/hydra/launcher/joblib.yaml`.
+`n_jobs` is read from `HYDRA_N_JOBS` (default `3`).
+
+Override options:
+
+- CLI: `hydra.launcher.n_jobs=2`
+- Env var: `HYDRA_N_JOBS=2`
+- Auto GPU scaling helper: `python scripts/run_sweep.py ...`
+
+Single run with defaults:
 
 ```bash
-# Run with defaults
-python scripts/train_gat_baseline.py
-
-# Override at the CLI (Hydra syntax)
-python scripts/train_gat_baseline.py train.episodes=200 train.batch_size=128
-python scripts/train_gat_baseline.py train.optimizer.name=adam wandb.enabled=true
-python scripts/train_gat_baseline.py env.end_time=1800 env.gui=true
+python scripts/run_experiment.py
 ```
 
-Key top-level keys:
-
-| Key | Description |
-|---|---|
-| `train.*` | Episodes, batch size, replay capacity, optimizer config |
-| `train.optimizer.name` | `meta_adam` (default) or `adam` |
-| `wandb.enabled` | Set `true` to log to W&B (needs `WANDB_API_KEY` in `.env`) |
-| `runtime.out_dir` | Directory for checkpoints and logs |
-
----
-
-### `lightning_train.yaml` → `train/train.py`
-
-PyTorch Lightning trainer. Pulls in `env: default`, `model: default`, `train: lightning`.
+Use an experiment preset:
 
 ```bash
-# Run with defaults
-python -m train.train
-
-# Common overrides
-python -m train.train train.max_epochs=50 wandb.enabled=true
-python -m train.train runtime.devices=4 runtime.accelerator=gpu
-python -m train.train train.optimizer.name=adam train.batch_size=512
+python scripts/run_experiment.py experiment=grid5x5
+python scripts/run_experiment.py experiment=fixed_time_grid5x5
 ```
 
-Key top-level keys:
-
-| Key | Description |
-|---|---|
-| `train.*` | Pulled from `train/lightning.yaml`; optimizer, SAC settings, schedule |
-| `runtime.accelerator` | `auto`, `gpu`, `cpu` |
-| `runtime.devices` | Number of GPUs/CPUs |
-| `runtime.enable_checkpointing` | Save Lightning checkpoints |
-| `wandb.*` | W&B logging (project, run name, log_model) |
-
----
-
-### `sumo_baseline.yaml` → `scripts/run_sumo_baseline.py`
-
-Runs fixed-time SUMO signals (no RL) to collect a comparison baseline. Pulls in `env: default`.
+Switch scenario and algorithm directly:
 
 ```bash
-python scripts/run_sumo_baseline.py
-
-# Override env settings
-python scripts/run_sumo_baseline.py env.end_time=1800 env.gui=true
+python scripts/run_experiment.py scenario=cologne8 algo=discrete_sac
 ```
 
----
-
-### `evaluate.yaml` → `train/evaluate.py`
-
-Loads a trained Lightning checkpoint and evaluates it on SUMO. Pulls in `env: default` and `model: default`.
+Common parameter overrides:
 
 ```bash
-# Checkpoint path is required
-python -m train.evaluate runtime.checkpoint_path=runs/lightning_train/checkpoints/last.ckpt
+# Discrete SAC trainer
+python scripts/run_experiment.py \
+    algo=discrete_sac \
+    train.episodes=200 \
+    train.batch_size=128 \
+    logger.wandb.enabled=true
 
-# Run with GUI and more episodes
-python -m train.evaluate \
-    runtime.checkpoint_path=runs/lightning_train/checkpoints/last.ckpt \
-    runtime.episodes=10 \
+# Baseline with GUI
+python scripts/run_experiment.py \
+    algo=fixed_time_baseline \
     runtime.gui=true
 ```
 
----
-
-## Secrets
-
-All secrets (API keys, etc.) go in `.env` at the repo root — **never** in YAML. Copy `.env.example` to get started:
+Multi-run sweep across scenarios and seeds:
 
 ```bash
-cp .env.example .env
-# Then fill in WANDB_API_KEY
+python scripts/run_experiment.py -m \
+    scenario=grid4x4,cologne1,cologne8 \
+    algo=discrete_sac \
+    seed=1,2,3
 ```
 
-Variables read from `.env`:
-
-| Variable | Purpose |
-|---|---|
-| `WANDB_API_KEY` | W&B authentication |
-| `WANDB_MODE` | `online` / `offline` / `disabled` |
-| `LIBSUMO_AS_TRACI=1` | Route libsumo through the TraCI interface |
-
----
-
-## How Hydra overrides work
-
-Any key in a YAML file can be overridden on the command line using dot-notation:
+Print composed config (dry run):
 
 ```bash
-# Override a nested key
-python scripts/train_gat_baseline.py train.optimizer.meta.hyper_lr=1e-6
-
-# Override a config group entirely (swap env scenario)
-python -m train.train env=my_custom_env
-
-# Print the composed config without running (dry-run)
-python scripts/train_gat_baseline.py --cfg job
+python scripts/run_experiment.py --cfg job
 ```
+
+## Legacy entrypoints
+
+The following utilities remain available:
+
+- `train/evaluate.py`
+- `scripts/visualize_graph_influence.py`
+
+For new experiments, prefer `scripts/run_experiment.py`.

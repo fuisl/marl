@@ -1,0 +1,8 @@
+name: grid4x4
+
+env_params:
+  net_file: nets/grid4x4/grid4x4.net.xml
+  route_file: nets/grid4x4/grid4x4_1.rou.xml
+  begin_time: 0
+  end_time: 3600
+  delta_t: 5

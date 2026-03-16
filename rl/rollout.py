@@ -1,7 +1,7 @@
 """Rollout worker — collects transitions from the SUMO environment.
 
-Keeps the rollout loop separate from the training loop so that Lightning
-only handles optimization, not simulation interaction.
+Keeps simulation interaction separate from optimization so training loops
+can remain simple and easy to extend.
 """
 
 from __future__ import annotations
