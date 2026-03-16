@@ -129,6 +129,9 @@ The edge distance is the shortest walked distance, and the lane attribute is the
 
 $$
 d_{ij} = \min_{\rho:i \leadsto j} \sum_{(u,v)\in \rho} \mathrm{len}(u,v)
+
+$$
+$$
 \ell_{ij} = \min_{(u,v)\in \rho^\star} \mathrm{lanes}(u,v)
 $$
 
