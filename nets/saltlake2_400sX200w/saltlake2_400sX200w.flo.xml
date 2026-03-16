@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2024-03-12 21:26:58 by Eclipse SUMO netedit Version 1.19.0
+-->
+
+<routes xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="https://sumo.dlr.de/xsd/routes_file.xsd">
+    <!-- VTypes -->
+    <vType id="Car" vClass="passenger"/>
+    <!-- Routes -->
+    <route id="7241_SLL" edges="top0A3 A3B3 B3top1"/>
+    <route id="7241_SLR" edges="top0A3 A3B3 B3B2"/>
+    <route id="7241_SLT" edges="top0A3 A3B3 B3C3"/>
+    <route id="7241_SR" edges="top0A3 A3left3"/>
+    <route id="7241_ST" edges="top0A3 A3A2"/>
+    <route id="7241_EL" edges="left3A3 A3top0"/>
+    <route id="7241_ER" edges="left3A3 A3A2"/>
+    <route id="7241_ETL" edges="left3A3 A3B3 B3top1"/>
+    <route id="7241_ETR" edges="left3A3 A3B3 B3B2"/>
+    <route id="7241_ETT" edges="left3A3 A3B3 B3C3"/>
+    <route id="7241_NL" edges="A2A3 A3left3"/>
+    <route id="7241_NRL" edges="A2A3 A3B3 B3top1"/>
+    <route id="7241_NRR" edges="A2A3 A3B3 B3B2"/>
+    <route id="7241_NRT" edges="A2A3 A3B3 B3C3"/>
+    <route id="7241_NT" edges="A2A3 A3top0"/>
+	<route id="7242_NLL" edges="B2B3 B3A3 A3A2"/>
+    <route id="7242_NLT" edges="B2B3 B3A3 A3left3"/>
+    <route id="7242_NR" edges="B2B3 B3C3"/>
+    <route id="7242_NT" edges="B2B3 B3top1"/>
+    <route id="7242_SL" edges="top1B3 B3C3"/>
+    <route id="7242_SRL" edges="top1B3 B3A3 A3A2"/>
+    <route id="7242_SRR" edges="top1B3 B3A3 A3top0"/>
+    <route id="7242_SRT" edges="top1B3 B3A3 A3left3"/>
+    <route id="7242_ST" edges="top1B3 B3B2"/>
+    <route id="7242_WL" edges="C3B3 B3B2"/>
+    <route id="7242_WR" edges="C3B3 B3top1"/>
+    <route id="7242_WTL" edges="C3B3 B3A3 A3A2"/>
+    <route id="7242_WTR" edges="C3B3 B3A3 A3top0"/>
+    <route id="7242_WTT" edges="C3B3 B3A3 A3left3"/>
+    <!-- Vehicles, persons and containers (sorted by depart) -->
+    	
+</routes>

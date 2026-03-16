@@ -92,14 +92,64 @@ class MARLDiscreteSAC(nn.Module):
     # ==================================================================
     # Forward helpers
     # ==================================================================
+    @staticmethod
+    def _pool_agent_latents(
+        z_nodes: Tensor,
+        agent_node_indices: Tensor | None = None,
+        agent_node_mask: Tensor | None = None,
+    ) -> Tensor:
+        """Pool node embeddings into per-agent embeddings.
+
+        If no mapping is provided, this is an identity map and assumes one
+        graph node per RL agent.
+        """
+        if agent_node_indices is None:
+            return z_nodes
+
+        if agent_node_mask is None:
+            agent_node_mask = agent_node_indices >= 0
+
+        if z_nodes.dim() == 2:
+            z_nodes = z_nodes.unsqueeze(0)
+            squeeze_result = True
+        else:
+            squeeze_result = False
+
+        if agent_node_indices.dim() == 2:
+            agent_node_indices = agent_node_indices.unsqueeze(0).expand(
+                z_nodes.shape[0], -1, -1
+            )
+        if agent_node_mask.dim() == 2:
+            agent_node_mask = agent_node_mask.unsqueeze(0).expand(
+                z_nodes.shape[0], -1, -1
+            )
+
+        safe_indices = agent_node_indices.clamp_min(0)
+        num_agents = safe_indices.shape[1]
+        latent_dim = z_nodes.shape[-1]
+
+        expanded_nodes = z_nodes.unsqueeze(1).expand(-1, num_agents, -1, -1)
+        gather_idx = safe_indices.unsqueeze(-1).expand(-1, -1, -1, latent_dim)
+        selected = torch.gather(expanded_nodes, 2, gather_idx)
+
+        weights = agent_node_mask.unsqueeze(-1).to(selected.dtype)
+        pooled = (selected * weights).sum(dim=2) / weights.sum(dim=2).clamp_min(1.0)
+
+        if squeeze_result:
+            return pooled[0]
+        return pooled
+
     def encode(
         self,
         obs: Tensor,
         edge_index: Tensor,
         edge_attr: Tensor | None = None,
+        agent_node_indices: Tensor | None = None,
+        agent_node_mask: Tensor | None = None,
     ) -> Tensor:
-        """Run encoder. ``obs`` shape: ``[n_agents, obs_dim]``."""
-        return self.encoder(obs, edge_index, edge_attr)
+        """Run encoder and optionally pool graph nodes back to RL agents."""
+        z_nodes = self.encoder(obs, edge_index, edge_attr)
+        return self._pool_agent_latents(z_nodes, agent_node_indices, agent_node_mask)
 
     def select_action(
         self,
@@ -108,9 +158,18 @@ class MARLDiscreteSAC(nn.Module):
         edge_attr: Tensor | None = None,
         action_mask: Tensor | None = None,
         deterministic: bool = False,
+        *,
+        agent_node_indices: Tensor | None = None,
+        agent_node_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """End-to-end: obs → encoder → actor → (action, log_prob)."""
-        z = self.encode(obs, edge_index, edge_attr)
+        z = self.encode(
+            obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices=agent_node_indices,
+            agent_node_mask=agent_node_mask,
+        )
         return self.actor.get_action(z, action_mask, deterministic)
 
     def get_action_probs(
@@ -119,9 +178,18 @@ class MARLDiscreteSAC(nn.Module):
         edge_index: Tensor,
         edge_attr: Tensor | None = None,
         action_mask: Tensor | None = None,
+        *,
+        agent_node_indices: Tensor | None = None,
+        agent_node_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Return ``(z, action_probs, log_action_probs)``."""
-        z = self.encode(obs, edge_index, edge_attr)
+        z = self.encode(
+            obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices=agent_node_indices,
+            agent_node_mask=agent_node_mask,
+        )
         action_probs, log_action_probs = self.actor.get_action_probs(z, action_mask)
         return z, action_probs, log_action_probs
 
@@ -130,9 +198,18 @@ class MARLDiscreteSAC(nn.Module):
         obs: Tensor,
         edge_index: Tensor,
         edge_attr: Tensor | None = None,
+        *,
+        agent_node_indices: Tensor | None = None,
+        agent_node_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Compute online twin Q-values: (q1, q2) each ``[n_agents, num_actions]``."""
-        z = self.encode(obs, edge_index, edge_attr)
+        z = self.encode(
+            obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices=agent_node_indices,
+            agent_node_mask=agent_node_mask,
+        )
         return self.critic(z)
 
     def target_critic_values(
@@ -140,10 +217,19 @@ class MARLDiscreteSAC(nn.Module):
         obs: Tensor,
         edge_index: Tensor,
         edge_attr: Tensor | None = None,
+        *,
+        agent_node_indices: Tensor | None = None,
+        agent_node_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """Compute target twin Q-values (no grad)."""
         with torch.no_grad():
-            z = self.encode(obs, edge_index, edge_attr)
+            z = self.encode(
+                obs,
+                edge_index,
+                edge_attr,
+                agent_node_indices=agent_node_indices,
+                agent_node_mask=agent_node_mask,
+            )
             return self.target_critic(z)
 
     # ==================================================================

@@ -1,0 +1,15 @@
+defaults:
+  - env: default
+  - model: default
+  - _self_
+
+runtime:
+  checkpoint_path: null
+  episodes: 5
+  device: cpu
+  gui: false
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

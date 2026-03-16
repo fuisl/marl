@@ -62,9 +62,11 @@ class TrafficSignalEnv:
         begin_time: int = 0,
         end_time: int = 3600,
         additional_files: list[str] | None = None,
+        graph_builder_mode: str = "original",
     ) -> None:
         self.delta_t = delta_t
         self.net_file = net_file
+        self.graph_builder_mode = graph_builder_mode
 
         # --- SUMO adapter ---
         self.adapter = TraCIAdapter(
@@ -94,6 +96,9 @@ class TrafficSignalEnv:
         self.graph_builder: GraphBuilder | None = None
         self.edge_index: Tensor | None = None
         self.edge_attr: Tensor | None = None
+        self.graph_node_ids: list[str] = []
+        self.agent_node_indices: Tensor | None = None
+        self.agent_node_mask: Tensor | None = None
 
         # Per-agent caches
         self._green_phases: dict[str, list[int]] = {}
@@ -105,6 +110,16 @@ class TrafficSignalEnv:
         self._all_red_phase_map: dict[str, dict[tuple[int, int], int]] = {}
         self._max_lanes: int = 0
         self._max_green: int = 0
+        self._last_interval_flow: dict[str, float] = {
+            "arrived_vehicles": 0.0,
+            "departed_vehicles": 0.0,
+            "teleported_vehicles": 0.0,
+        }
+        self._depart_time_by_vehicle: dict[str, float] = {}
+        self._episode_travel_time_sum_s: float = 0.0
+        self._episode_arrived_vehicles: int = 0
+        self._node_incoming_lanes: dict[str, list[str]] = {}
+        self._node_attached_rl_ids: dict[str, tuple[str, ...]] = {}
 
     # ==================================================================
     # Core gym-like interface
@@ -113,14 +128,33 @@ class TrafficSignalEnv:
         """Start a new episode. Returns initial observation ``TensorDict``."""
         self.adapter.close()  # no-op on first call
         self.adapter.start()
+        self._depart_time_by_vehicle = {}
+        self._episode_travel_time_sum_s = 0.0
+        self._episode_arrived_vehicles = 0
 
         # Discover agents
         self.tl_ids = self.adapter.get_traffic_light_ids()
         self.n_agents = len(self.tl_ids)
 
         # Build static graph once
-        self.graph_builder = GraphBuilder(self.net_file, self.tl_ids)
+        self.graph_builder = GraphBuilder(
+            self.net_file,
+            self.tl_ids,
+            mode=self.graph_builder_mode,
+        )
         self.edge_index, self.edge_attr = self.graph_builder.build()
+        self.graph_node_ids = self.graph_builder.node_ids
+        self.agent_node_indices = self.graph_builder.agent_node_indices
+        self.agent_node_mask = self.graph_builder.agent_node_mask
+        self._node_incoming_lanes = self._build_graph_node_incoming_lane_map()
+        self._node_attached_rl_ids = {
+            node_id: attached
+            for node_id, attached in zip(
+                self.graph_node_ids,
+                self.graph_builder.attached_rl_ids_by_node,
+                strict=True,
+            )
+        }
 
         # Cache phase info & register constraints per agent
         for tl_id in self.tl_ids:
@@ -151,9 +185,10 @@ class TrafficSignalEnv:
             )
 
         # Fixed observation dimensions (for padding)
-        self._max_lanes = max(
-            len(self._controlled_lanes[tl]) for tl in self.tl_ids
-        )
+        lane_counts = [len(self._controlled_lanes[tl]) for tl in self.tl_ids]
+        if self.graph_builder_mode == "all_intersections":
+            lane_counts.extend(len(lanes) for lanes in self._node_incoming_lanes.values())
+        self._max_lanes = max(lane_counts) if lane_counts else 0
         self._max_green = max(
             len(self._green_phases[tl]) for tl in self.tl_ids
         )
@@ -181,9 +216,32 @@ class TrafficSignalEnv:
             self._maybe_apply_action(tl_id, target_green)
 
         # --- Advance simulation by delta_t seconds ---
+        arrived_total = 0.0
+        departed_total = 0.0
+        teleported_total = 0.0
         for _ in range(self.delta_t):
             self.adapter.simulation_step()
             self._sync_phase_state_from_sumo()
+            arrived_total += float(self.adapter.get_arrived_number())
+            departed_total += float(self.adapter.get_departed_number())
+            teleported_total += float(self.adapter.get_teleported_number())
+
+            now = float(self.adapter.current_time)
+            for vid in self.adapter.get_departed_ids():
+                # Record first observed departure time.
+                self._depart_time_by_vehicle.setdefault(vid, now)
+            for vid in self.adapter.get_arrived_ids():
+                t_depart = self._depart_time_by_vehicle.pop(vid, None)
+                if t_depart is None:
+                    continue
+                self._episode_travel_time_sum_s += max(0.0, now - t_depart)
+                self._episode_arrived_vehicles += 1
+
+        self._last_interval_flow = {
+            "arrived_vehicles": arrived_total,
+            "departed_vehicles": departed_total,
+            "teleported_vehicles": teleported_total,
+        }
 
         # --- Build output ---
         td = self._build_tensordict()
@@ -204,6 +262,53 @@ class TrafficSignalEnv:
 
     def close(self) -> None:
         self.adapter.close()
+
+    def get_interval_kpis(self) -> dict[str, float]:
+        """Return network-level KPIs for the latest decision interval."""
+        lane_ids: set[str] = set()
+        for lanes in self._controlled_lanes.values():
+            lane_ids.update(lanes)
+
+        if not lane_ids:
+            return {
+                "avg_delay_s": 0.0,
+                "avg_queue_length": 0.0,
+                "avg_speed_mps": 0.0,
+                "avg_occupancy_pct": 0.0,
+                "min_expected_vehicles": float(self.adapter.min_expected_vehicles),
+                **self._last_interval_flow,
+            }
+
+        lane_count = float(len(lane_ids))
+        total_waiting = sum(self.adapter.get_lane_waiting_time(l) for l in lane_ids)
+        total_vehicles = sum(self.adapter.get_lane_vehicle_count(l) for l in lane_ids)
+
+        # Per-vehicle delay is more stable across different network sizes.
+        avg_waiting = total_waiting / max(float(total_vehicles), 1.0)
+        avg_queue = sum(self.adapter.get_lane_halting_number(l) for l in lane_ids) / lane_count
+        avg_speed = sum(self.adapter.get_lane_mean_speed(l) for l in lane_ids) / lane_count
+        avg_occupancy = sum(self.adapter.get_lane_occupancy(l) for l in lane_ids) / lane_count
+
+        return {
+            "avg_delay_s": float(avg_waiting),
+            "avg_queue_length": float(avg_queue),
+            "avg_speed_mps": float(avg_speed),
+            "avg_occupancy_pct": float(avg_occupancy),
+            "min_expected_vehicles": float(self.adapter.min_expected_vehicles),
+            "network_total_waiting_s": float(total_waiting),
+            "network_total_vehicles": float(total_vehicles),
+            **self._last_interval_flow,
+        }
+
+    def get_episode_kpis(self) -> dict[str, float]:
+        """Return episode-level KPIs commonly reported in traffic RL papers."""
+        avg_travel_time = 0.0
+        if self._episode_arrived_vehicles > 0:
+            avg_travel_time = self._episode_travel_time_sum_s / self._episode_arrived_vehicles
+        return {
+            "avg_travel_time_s": float(avg_travel_time),
+            "arrived_vehicles": float(self._episode_arrived_vehicles),
+        }
 
     # ==================================================================
     # Observation helpers
@@ -232,6 +337,7 @@ class TrafficSignalEnv:
             obs_list.append(self._get_observation(tl_id))
 
         obs = torch.stack(obs_list, dim=0)  # [n_agents, d_obs]
+        graph_obs = self._build_graph_observation(obs)
 
         # Action masks
         masks: list[Tensor] = []
@@ -255,6 +361,9 @@ class TrafficSignalEnv:
         td = TensorDict(
             {
                 "agents": agents_td,
+                "graph_observation": graph_obs,
+                "agent_node_indices": self.agent_node_indices,
+                "agent_node_mask": self.agent_node_mask,
                 "edge_index": self.edge_index,
             },
             batch_size=[],
@@ -279,15 +388,19 @@ class TrafficSignalEnv:
             t = t[:target_len]
         return t
 
-    def _get_observation(self, tl_id: str) -> Tensor:
-        """Build observation vector for one intersection.
+    def _build_observation_from_lanes_and_phase(
+        self,
+        lanes: list[str],
+        *,
+        phase_owner_tl_id: str | None,
+    ) -> Tensor:
+        """Build one observation vector from lane metrics and optional phase state.
 
         Layout (padded to uniform size)::
 
             [queue(max_lanes) | wait(max_lanes) | occ(max_lanes)
              | speed(max_lanes) | phase_onehot(max_green) | elapsed(1)]
         """
-        lanes = self._controlled_lanes[tl_id]
         ml = self._max_lanes
 
         queue = self._pad_1d(
@@ -304,19 +417,69 @@ class TrafficSignalEnv:
         )
 
         # Phase one-hot (padded to max_green)
-        current_gp = self._current_green[tl_id]
-        if current_gp in self._green_phases[tl_id]:
-            action_idx = self.constraints.green_phase_to_action(tl_id, current_gp)
-        else:
-            action_idx = 0
         phase_onehot = torch.zeros(self._max_green, dtype=torch.float32)
-        phase_onehot[action_idx] = 1.0
+        elapsed_value = 0.0
+        if phase_owner_tl_id is not None:
+            current_gp = self._current_green[phase_owner_tl_id]
+            if current_gp in self._green_phases[phase_owner_tl_id]:
+                action_idx = self.constraints.green_phase_to_action(
+                    phase_owner_tl_id,
+                    current_gp,
+                )
+            else:
+                action_idx = 0
+            phase_onehot[action_idx] = 1.0
+            elapsed_value = self._elapsed_green[phase_owner_tl_id]
 
-        elapsed = torch.tensor(
-            [self._elapsed_green[tl_id]], dtype=torch.float32
-        )
+        elapsed = torch.tensor([elapsed_value], dtype=torch.float32)
 
         return torch.cat([queue, wait, occ, speed, phase_onehot, elapsed])
+
+    def _get_observation(self, tl_id: str) -> Tensor:
+        """Build observation vector for one controlled traffic light."""
+        return self._build_observation_from_lanes_and_phase(
+            self._controlled_lanes[tl_id],
+            phase_owner_tl_id=tl_id,
+        )
+
+    def _build_graph_observation(self, agent_obs: Tensor) -> Tensor:
+        if self.graph_builder_mode != "all_intersections":
+            return agent_obs.clone()
+
+        graph_obs_list = [
+            self._get_graph_node_observation(node_id)
+            for node_id in self.graph_node_ids
+        ]
+        return torch.stack(graph_obs_list, dim=0)
+
+    def _get_graph_node_observation(self, node_id: str) -> Tensor:
+        attached_rl_ids = self._node_attached_rl_ids.get(node_id, ())
+        phase_owner = attached_rl_ids[0] if attached_rl_ids else None
+        lanes = self._node_incoming_lanes.get(node_id, [])
+        return self._build_observation_from_lanes_and_phase(
+            lanes,
+            phase_owner_tl_id=phase_owner,
+        )
+
+    def _build_graph_node_incoming_lane_map(self) -> dict[str, list[str]]:
+        if self.graph_builder is None or self.graph_builder_mode != "all_intersections":
+            return {}
+
+        node_lanes: dict[str, list[str]] = {}
+        for node_id in self.graph_node_ids:
+            try:
+                node = self.graph_builder.net.getNode(node_id)
+            except KeyError:
+                node_lanes[node_id] = []
+                continue
+
+            lane_ids: list[str] = []
+            for edge in node.getIncoming():
+                if hasattr(edge, "getLanes"):
+                    lane_ids.extend(lane.getID() for lane in edge.getLanes())
+            node_lanes[node_id] = lane_ids
+
+        return node_lanes
 
     # ==================================================================
     # Reward
@@ -330,9 +493,27 @@ class TrafficSignalEnv:
                 waiting_times=[self.adapter.get_lane_waiting_time(l) for l in lanes],
                 mean_speeds=[self.adapter.get_lane_mean_speed(l) for l in lanes],
                 occupancies=[self.adapter.get_lane_occupancy(l) for l in lanes],
+                pressure=self._compute_intersection_pressure(tl_id, lanes),
             )
             metrics_list.append(m)
         return self.reward_calc.compute_batch(metrics_list)
+
+    def _compute_intersection_pressure(self, tl_id: str, incoming_lanes: list[str]) -> float:
+        """Compute queue pressure = incoming halting - outgoing halting.
+
+        Outgoing lanes are inferred from controlled links and deduplicated.
+        """
+        in_queue = sum(self.adapter.get_lane_halting_number(l) for l in incoming_lanes)
+
+        outgoing_lanes: set[str] = set()
+        for signal_links in self.adapter.get_controlled_links(tl_id):
+            for link in signal_links:
+                # Each link tuple is (in_lane, out_lane, via_lane)
+                if len(link) >= 2 and link[1]:
+                    outgoing_lanes.add(link[1])
+
+        out_queue = sum(self.adapter.get_lane_halting_number(l) for l in outgoing_lanes)
+        return float(in_queue - out_queue)
 
     # ==================================================================
     # Phase helpers

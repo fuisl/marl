@@ -90,8 +90,11 @@ class TraCIAdapter:
             return
 
         try:
-            # Both traci and libsumo expose close(); traci docs also allow close(False).
-            self._conn.close(wait)
+            # libsumo's close() takes no arguments; traci's accepts close(False).
+            try:
+                self._conn.close(wait)
+            except TypeError:
+                self._conn.close()
         finally:
             self._conn = None
 
@@ -164,8 +167,14 @@ class TraCIAdapter:
     def get_departed_number(self) -> int:
         return self._require_conn().simulation.getDepartedNumber()
 
+    def get_departed_ids(self) -> list[str]:
+        return list(self._require_conn().simulation.getDepartedIDList())
+
     def get_arrived_number(self) -> int:
         return self._require_conn().simulation.getArrivedNumber()
+
+    def get_arrived_ids(self) -> list[str]:
+        return list(self._require_conn().simulation.getArrivedIDList())
 
     def get_teleported_number(self) -> int:
         return self._require_conn().simulation.getStartingTeleportNumber()

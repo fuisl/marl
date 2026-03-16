@@ -92,6 +92,39 @@ class FakeTraCIAdapter:
     def get_controlled_lanes(self, tl_id: str) -> list[str]:
         return self.lanes[tl_id]
 
+    def get_controlled_links(self, tl_id: str) -> list[list[tuple[str, str, str]]]:
+        # Mimic TraCI shape: list over signal indices, each containing
+        # (in_lane, out_lane, via_lane) tuples.
+        lanes = self.lanes[tl_id]
+        return [
+            [(lanes[0], lanes[0], "")],
+            [(lanes[1], lanes[1], "")],
+        ]
+
+    @staticmethod
+    def get_arrived_number() -> int:
+        return 0
+
+    @staticmethod
+    def get_departed_number() -> int:
+        return 0
+
+    @staticmethod
+    def get_teleported_number() -> int:
+        return 0
+
+    @staticmethod
+    def get_arrived_ids() -> list[str]:
+        return []
+
+    @staticmethod
+    def get_departed_ids() -> list[str]:
+        return []
+
+    @staticmethod
+    def get_lane_vehicle_count(lane_id: str) -> int:
+        return 1 if lane_id.endswith("1") else 2
+
     @staticmethod
     def get_lane_halting_number(lane_id: str) -> int:
         return 1 if lane_id.endswith("1") else 2
@@ -110,14 +143,28 @@ class FakeTraCIAdapter:
 
 
 class FakeGraphBuilder:
-    def __init__(self, net_file: str, tl_ids: list[str]) -> None:
+    def __init__(
+        self,
+        net_file: str,
+        tl_ids: list[str],
+        *,
+        mode: str = "original",
+    ) -> None:
         self.net_file = net_file
         self.tl_ids = tl_ids
+        self.mode = mode
+        self.node_ids = list(tl_ids)
+        self.agent_node_indices = torch.tensor([[0], [1]], dtype=torch.long)
+        self.agent_node_mask = torch.tensor([[True], [True]], dtype=torch.bool)
 
     def build(self) -> tuple[torch.Tensor, torch.Tensor]:
         edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
         edge_attr = torch.tensor([[10.0, 1.0], [10.0, 1.0]], dtype=torch.float32)
         return edge_index, edge_attr
+
+    @property
+    def attached_rl_ids_by_node(self) -> list[tuple[str, ...]]:
+        return [(tl_id,) for tl_id in self.tl_ids]
 
 
 def _sample_valid_actions(mask: torch.Tensor) -> torch.Tensor:
@@ -152,12 +199,16 @@ def test_env_reset_and_step_shapes_and_finite(monkeypatch: object) -> None:
     obs = td["agents", "observation"]
     mask = td["agents", "action_mask"]
     edge_index = td["edge_index"]
+    graph_obs = td["graph_observation"]
 
     assert obs.ndim == 2
     assert mask.ndim == 2
     assert obs.shape[0] == env.n_agents
     assert mask.shape[0] == env.n_agents
     assert edge_index.shape[0] == 2
+    assert graph_obs.shape == obs.shape
+    assert td["agent_node_indices"].shape == (env.n_agents, 1)
+    assert td["agent_node_mask"].shape == (env.n_agents, 1)
     assert torch.all(mask.any(dim=1))
 
     obs_shape = obs.shape

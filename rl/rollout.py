@@ -37,6 +37,13 @@ class RolloutWorker:
         self.agent = agent
         self.device = torch.device(device)
 
+    @staticmethod
+    def _graph_inputs(td: TensorDict) -> tuple[Tensor, Tensor | None, Tensor | None]:
+        graph_obs = td.get("graph_observation", td["agents", "observation"])
+        agent_node_indices = td.get("agent_node_indices", None)
+        agent_node_mask = td.get("agent_node_mask", None)
+        return graph_obs, agent_node_indices, agent_node_mask
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -56,13 +63,19 @@ class RolloutWorker:
         td = td.to(self.device)
 
         for _ in range(n_steps):
-            obs = td["agents", "observation"]
+            obs, agent_node_indices, agent_node_mask = self._graph_inputs(td)
             edge_index = td["edge_index"]
             edge_attr = td.get("edge_attr", None)
             action_mask = td["agents", "action_mask"]
 
             actions, log_probs = self.agent.select_action(
-                obs, edge_index, edge_attr, action_mask, deterministic
+                obs,
+                edge_index,
+                edge_attr,
+                action_mask,
+                deterministic,
+                agent_node_indices=agent_node_indices,
+                agent_node_mask=agent_node_mask,
             )
 
             next_td = self.env.step(actions.cpu())
@@ -91,13 +104,19 @@ class RolloutWorker:
         steps = 0
 
         while True:
-            obs = td["agents", "observation"]
+            obs, agent_node_indices, agent_node_mask = self._graph_inputs(td)
             edge_index = td["edge_index"]
             edge_attr = td.get("edge_attr", None)
             action_mask = td["agents", "action_mask"]
 
             actions, _ = self.agent.select_action(
-                obs, edge_index, edge_attr, action_mask, deterministic
+                obs,
+                edge_index,
+                edge_attr,
+                action_mask,
+                deterministic,
+                agent_node_indices=agent_node_indices,
+                agent_node_mask=agent_node_mask,
             )
 
             next_td = self.env.step(actions.cpu()).to(self.device)
@@ -150,9 +169,16 @@ class RolloutWorker:
                             },
                             batch_size=td["agents"].batch_size,
                         ),
+                        "graph_observation": next_td.get(
+                            "graph_observation",
+                            next_td["agents", "observation"],
+                        ),
                     },
                     batch_size=[],
                 ),
+                "graph_observation": td.get("graph_observation", td["agents", "observation"]),
+                "agent_node_indices": td["agent_node_indices"],
+                "agent_node_mask": td["agent_node_mask"],
                 "edge_index": td["edge_index"],
             },
             batch_size=[],

@@ -74,21 +74,40 @@ class DiscreteSACLossComputer:
 
         next_obs = batch["next", "agents", "observation"]    # [B, n_agents, obs_dim]
         next_mask = batch["next", "agents", "action_mask"]   # [B, n_agents, num_actions]
+        graph_obs = batch.get("graph_observation", obs)
+        next_graph_obs = batch["next"].get("graph_observation", next_obs)
 
         edge_index = batch["edge_index"]               # [B, 2, E] or [2, E]
         edge_attr = batch.get("edge_attr", None)
+        agent_node_indices = batch.get("agent_node_indices", None)
+        agent_node_mask = batch.get("agent_node_mask", None)
 
         B, N, _ = obs.shape
 
         # --- Critic loss ---
         critic_loss, q1_mean, q2_mean = self._critic_loss(
-            obs, actions, rewards, dones, next_obs, next_mask,
-            edge_index, edge_attr, B, N,
+            graph_obs,
+            actions,
+            rewards,
+            dones,
+            next_graph_obs,
+            next_mask,
+            edge_index,
+            edge_attr,
+            agent_node_indices,
+            agent_node_mask,
+            B,
         )
 
         # --- Actor loss ---
         actor_loss, entropy = self._actor_loss(
-            obs, action_mask, edge_index, edge_attr, B, N,
+            graph_obs,
+            action_mask,
+            edge_index,
+            edge_attr,
+            agent_node_indices,
+            agent_node_mask,
+            B,
         )
 
         # --- Alpha loss ---
@@ -109,22 +128,30 @@ class DiscreteSACLossComputer:
     # ------------------------------------------------------------------
     def _critic_loss(
         self,
-        obs: Tensor,
+        graph_obs: Tensor,
         actions: Tensor,
         rewards: Tensor,
         dones: Tensor,
-        next_obs: Tensor,
+        next_graph_obs: Tensor,
         next_mask: Tensor,
         edge_index: Tensor,
         edge_attr: Tensor | None,
+        agent_node_indices: Tensor | None,
+        agent_node_mask: Tensor | None,
         B: int,
-        N: int,
     ) -> tuple[Tensor, float, float]:
         """Compute clipped double-Q critic loss."""
         alpha = self.agent.alpha.detach()
 
         # Current Q-values
-        q1_all, q2_all = self._batch_critic(obs, edge_index, edge_attr, B)
+        q1_all, q2_all = self._batch_critic(
+            graph_obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices,
+            agent_node_mask,
+            B,
+        )
         # Gather Q-values for taken actions: [B, N, 1]
         actions_idx = actions.long().unsqueeze(-1)
         q1 = q1_all.gather(-1, actions_idx)
@@ -133,14 +160,26 @@ class DiscreteSACLossComputer:
         # Target Q-values (no grad)
         with torch.no_grad():
             # Next action distribution from current policy
-            next_z = self._batch_encode(next_obs, edge_index, edge_attr, B)
+            next_z = self._batch_encode(
+                next_graph_obs,
+                edge_index,
+                edge_attr,
+                agent_node_indices,
+                agent_node_mask,
+                B,
+            )
             next_probs, next_log_probs = self.agent.actor.get_action_probs(
                 next_z, next_mask
             )
 
             # Target Q-values
             tq1_all, tq2_all = self._batch_target_critic(
-                next_obs, edge_index, edge_attr, B
+                next_graph_obs,
+                edge_index,
+                edge_attr,
+                agent_node_indices,
+                agent_node_mask,
+                B,
             )
             tq_min = torch.min(tq1_all, tq2_all)
 
@@ -157,24 +196,39 @@ class DiscreteSACLossComputer:
 
     def _actor_loss(
         self,
-        obs: Tensor,
+        graph_obs: Tensor,
         action_mask: Tensor,
         edge_index: Tensor,
         edge_attr: Tensor | None,
+        agent_node_indices: Tensor | None,
+        agent_node_mask: Tensor | None,
         B: int,
-        N: int,
     ) -> tuple[Tensor, float]:
         """Compute actor loss: minimize E[alpha * log pi - Q]."""
         alpha = self.agent.alpha.detach()
 
-        z = self._batch_encode(obs, edge_index, edge_attr, B)
+        z = self._batch_encode(
+            graph_obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices,
+            agent_node_mask,
+            B,
+        )
         action_probs, log_action_probs = self.agent.actor.get_action_probs(
             z, action_mask
         )
 
         # Q-values from online critic (detach to not update critic via actor loss)
         with torch.no_grad():
-            q1_all, q2_all = self._batch_critic(obs, edge_index, edge_attr, B)
+            q1_all, q2_all = self._batch_critic(
+                graph_obs,
+                edge_index,
+                edge_attr,
+                agent_node_indices,
+                agent_node_mask,
+                B,
+            )
         q_min = torch.min(q1_all, q2_all)
 
         # actor loss = E_a[alpha * log pi(a|s) - Q(s, a)]
@@ -193,7 +247,13 @@ class DiscreteSACLossComputer:
     # Batched encode / critic helpers
     # ------------------------------------------------------------------
     def _batch_encode(
-        self, obs: Tensor, edge_index: Tensor, edge_attr: Tensor | None, B: int
+        self,
+        graph_obs: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor | None,
+        agent_node_indices: Tensor | None,
+        agent_node_mask: Tensor | None,
+        B: int,
     ) -> Tensor:
         """Encode a batch of observations through the graph encoder.
 
@@ -202,8 +262,8 @@ class DiscreteSACLossComputer:
 
         For now, assumes a **shared topology** across the batch (same edge_index).
         """
-        N = obs.shape[1]
-        obs_flat = obs.reshape(B * N, -1)  # [B*N, obs_dim]
+        num_graph_nodes = graph_obs.shape[1]
+        obs_flat = graph_obs.reshape(B * num_graph_nodes, -1)  # [B*N_graph, obs_dim]
 
         # Replicate edge_index for each batch element
         if edge_index.dim() == 3:
@@ -212,25 +272,56 @@ class DiscreteSACLossComputer:
             ei = edge_index
 
         # Build batch-diagonal edge_index for PyG
-        ei_batch = _batch_edge_index(ei, B, N)
+        ei_batch = _batch_edge_index(ei, B, num_graph_nodes)
         ea_batch = None
         if edge_attr is not None:
             ea = edge_attr[0] if edge_attr.dim() == 3 else edge_attr
             ea_batch = ea.repeat(B, 1)
 
         z_flat = self.agent.encoder(obs_flat, ei_batch, ea_batch)
-        return z_flat.reshape(B, N, -1)
+        z_nodes = z_flat.reshape(B, num_graph_nodes, -1)
+        return self.agent._pool_agent_latents(
+            z_nodes,
+            agent_node_indices=agent_node_indices,
+            agent_node_mask=agent_node_mask,
+        )
 
     def _batch_critic(
-        self, obs: Tensor, edge_index: Tensor, edge_attr: Tensor | None, B: int
+        self,
+        graph_obs: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor | None,
+        agent_node_indices: Tensor | None,
+        agent_node_mask: Tensor | None,
+        B: int,
     ) -> tuple[Tensor, Tensor]:
-        z = self._batch_encode(obs, edge_index, edge_attr, B)
+        z = self._batch_encode(
+            graph_obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices,
+            agent_node_mask,
+            B,
+        )
         return self.agent.critic(z)
 
     def _batch_target_critic(
-        self, obs: Tensor, edge_index: Tensor, edge_attr: Tensor | None, B: int
+        self,
+        graph_obs: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor | None,
+        agent_node_indices: Tensor | None,
+        agent_node_mask: Tensor | None,
+        B: int,
     ) -> tuple[Tensor, Tensor]:
-        z = self._batch_encode(obs, edge_index, edge_attr, B)
+        z = self._batch_encode(
+            graph_obs,
+            edge_index,
+            edge_attr,
+            agent_node_indices,
+            agent_node_mask,
+            B,
+        )
         return self.agent.target_critic(z)
 
 
