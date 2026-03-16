@@ -81,7 +81,13 @@ def main(cfg: DictConfig) -> None:
         _run_training(cfg, env_cfg)
         return
     if trainer == "fixed_time_baseline":
-        run_baseline(env_cfg)
+        run_baseline(
+            env_cfg,
+            out_dir=str(cfg.runtime.out_dir),
+            wandb_cfg=_as_plain(cfg.logger.wandb),
+            run_name=str(cfg.run_name),
+            seed=int(cfg.seed),
+        )
         return
 
     raise ValueError(f"Unknown algo.trainer '{trainer}'.")
