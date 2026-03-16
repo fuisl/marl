@@ -159,10 +159,9 @@ python scripts/run_experiment.py --cfg job
 
 ## Legacy entrypoints
 
-Legacy scripts remain available for backward compatibility:
+The following utilities remain available:
 
-- `scripts/train_gat_baseline.py`
-- `scripts/run_sumo_baseline.py`
 - `train/evaluate.py`
+- `scripts/visualize_graph_influence.py`
 
 For new experiments, prefer `scripts/run_experiment.py`.

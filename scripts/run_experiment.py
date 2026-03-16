@@ -23,9 +23,9 @@ from omegaconf import DictConfig, OmegaConf
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from config_utils import load_dotenv, resolve_repo_path
-from scripts.run_sumo_baseline import run_baseline
-from scripts.train_gat_baseline import train as run_training_loop
+from config_utils import load_dotenv
+from train.fixed_time_baseline import run_baseline
+from train.discrete_sac_loop import train as run_training_loop
 
 load_dotenv()
 

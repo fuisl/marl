@@ -55,11 +55,10 @@ python scripts/run_experiment.py -m \
 
 ## Legacy Entrypoints
 
-The older scripts are still available for compatibility:
+The following utilities remain available:
 
-- `scripts/train_gat_baseline.py`
-- `scripts/run_sumo_baseline.py`
 - `train/evaluate.py`
+- `scripts/visualize_graph_influence.py`
 
 For new work, prefer `scripts/run_experiment.py`.
 

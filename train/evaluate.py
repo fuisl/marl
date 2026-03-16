@@ -80,9 +80,15 @@ def main(cfg: DictConfig) -> None:
     if checkpoint_path in (None, ""):
         raise ValueError("Set runtime.checkpoint_path in config or via Hydra override.")
 
+    env_common = OmegaConf.to_container(cfg.env.common, resolve=True)
+    scenario_params = OmegaConf.to_container(cfg.scenario.env_params, resolve=True)
+    if not isinstance(env_common, dict) or not isinstance(scenario_params, dict):
+        raise ValueError("Invalid env/scenario config for evaluation.")
+    merged_env = {**env_common, **scenario_params}
+
     evaluate(
         checkpoint_path=str(resolve_repo_path(checkpoint_path)),
-        env_cfg=OmegaConf.to_container(cfg.env, resolve=True),
+        env_cfg=merged_env,
         model_cfg=OmegaConf.to_container(cfg.model, resolve=True),
         n_episodes=int(cfg.runtime.episodes),
         device=str(cfg.runtime.device),

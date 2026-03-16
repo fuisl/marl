@@ -12,7 +12,7 @@ It is based on the code paths that are actually used today:
 - `models/marl_discrete_sac.py`
 - `rl/losses.py`
 - `rl/rollout.py`
-- `scripts/train_gat_baseline.py`
+- `train/discrete_sac_loop.py`
 
 The shortest summary is:
 
@@ -431,12 +431,12 @@ This is exactly what `_batch_edge_index(...)` in `rl/losses.py` does.
 
 ## 10. Training Algorithm In Pseudocode
 
-The current standalone training path is `scripts/train_gat_baseline.py`.
+The current standalone training loop is `train/discrete_sac_loop.py`.
 
 It trains episode-by-episode, not step-by-step online.
 
 ```text
-Algorithm 1: Current training loop in scripts/train_gat_baseline.py
+Algorithm 1: Current training loop in train/discrete_sac_loop.py
 
 Input:
   env config, model config, optimizer config

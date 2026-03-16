@@ -33,9 +33,15 @@ def main(cfg: DictConfig) -> None:
     if checkpoint_raw in (None, ""):
         raise ValueError("Set runtime.checkpoint_path in config or via Hydra override.")
 
+    env_common = maybe_to_container(cfg.env.common)
+    scenario_params = maybe_to_container(cfg.scenario.env_params)
+    if not isinstance(env_common, dict) or not isinstance(scenario_params, dict):
+        raise ValueError("Invalid env/scenario config for visualization.")
+    env_cfg = {**env_common, **scenario_params}
+
     checkpoint_path = resolve_repo_path(checkpoint_raw)
-    env_name = Path(str(cfg.env.net_file)).stem
-    method_name = str(getattr(cfg.env, "graph_builder_mode", "original"))
+    env_name = Path(str(env_cfg["net_file"])).stem
+    method_name = str(env_cfg.get("graph_builder_mode", "original"))
 
     out_dir_raw = cfg.runtime.out_dir
     if out_dir_raw in (None, ""):
@@ -45,7 +51,7 @@ def main(cfg: DictConfig) -> None:
 
     summary = run_visualization(
         checkpoint_path=checkpoint_path,
-        env_cfg=maybe_to_container(cfg.env),
+        env_cfg=env_cfg,
         model_cfg=maybe_to_container(cfg.model),
         out_dir=out_dir,
         device=str(cfg.runtime.device),

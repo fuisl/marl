@@ -12,13 +12,13 @@ flowchart TB
 
   subgraph EntryPoints[Entry Points]
     RunExp[scripts/run_experiment.py]
-    GATBaseline[scripts/train_gat_baseline.py]
     Eval[train/evaluate.py]
-    SUMOBaseline[scripts/run_sumo_baseline.py]
+    Viz[scripts/visualize_graph_influence.py]
   end
 
   subgraph TrainStack[Training Stack]
-    ManualLoop[Manual SAC Loop\nReplay + Update\nscripts/train_gat_baseline.py]
+    TrainLoop[Discrete SAC Loop\ntrain/discrete_sac_loop.py]
+    BaselineLoop[Fixed-Time Baseline\ntrain/fixed_time_baseline.py]
     Rollout[RolloutWorker\nrl/rollout.py]
     Replay[TensorDictReplayBuffer\nrl/replay.py]
     Loss[DiscreteSACLossComputer\nrl/losses.py]
@@ -43,20 +43,19 @@ flowchart TB
   SUMO[SUMO Simulator\nTraCI or libsumo]
 
   Hydra --> RunExp
-  Hydra --> GATBaseline
   Hydra --> Eval
-  Hydra --> SUMOBaseline
+  Hydra --> Viz
 
-  RunExp --> GATBaseline
-  RunExp --> SUMOBaseline
-  GATBaseline --> ManualLoop
+  RunExp --> TrainLoop
+  RunExp --> BaselineLoop
   Eval --> Agent
-  SUMOBaseline --> Env
+  Viz --> Env
 
-  ManualLoop --> Replay
-  ManualLoop --> Loss
-  ManualLoop --> Agent
-  ManualLoop --> Opt
+  TrainLoop --> Replay
+  TrainLoop --> Loss
+  TrainLoop --> Agent
+  TrainLoop --> Opt
+  BaselineLoop --> Env
 
   Rollout --> Env
   Rollout --> Agent
@@ -76,16 +75,19 @@ flowchart TB
 
 ## 2. Baseline Architecture (Current)
 
-The current baseline is `scripts/train_gat_baseline.py` with Hydra-driven config, graph encoder + Discrete SAC, and optimizer selection through `rl/optimizers.py`.
+The current baseline uses `scripts/run_experiment.py` dispatching into
+`train/discrete_sac_loop.py` with graph encoder + Discrete SAC and optimizer
+selection through `rl/optimizers.py`.
 
 ```mermaid
 flowchart LR
-  Cfg[configs/gat_baseline.yaml\n+ env/default\n+ model/default] --> Train[scripts/train_gat_baseline.py]
-  Train --> Env[TrafficSignalEnv]
-  Train --> Agent[MARLDiscreteSAC]
-  Train --> Loss[DiscreteSACLossComputer]
-  Train --> RB[ReplayBuffer\nFIFO ring buffer]
-  Train --> Opt[make_optimizer]
+  Cfg[configs/run.yaml\n+ env/sumo + scenario/*\n+ model/default + train/default] --> Train[scripts/run_experiment.py]
+  Train --> Loop[train/discrete_sac_loop.py]
+  Loop --> Env[TrafficSignalEnv]
+  Loop --> Agent[MARLDiscreteSAC]
+  Loop --> Loss[DiscreteSACLossComputer]
+  Loop --> RB[ReplayBuffer\nFIFO ring buffer]
+  Loop --> Opt[make_optimizer]
 
   Agent --> Enc[GraphEncoder\n2x GATv2Conv]
   Agent --> Act[SharedDiscreteActor]
@@ -103,7 +105,7 @@ flowchart LR
 
 ```mermaid
 sequenceDiagram
-  participant T as train_gat_baseline.py
+  participant T as train/discrete_sac_loop.py
   participant E as TrafficSignalEnv
   participant A as MARLDiscreteSAC
   participant R as ReplayBuffer
