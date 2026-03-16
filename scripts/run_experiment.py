@@ -13,7 +13,9 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import signal
 import sys
 from typing import Any
 
@@ -24,10 +26,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from config_utils import load_dotenv
+from process_cleanup import terminate_descendants
 from train.fixed_time_baseline import run_baseline
 from train.discrete_sac_loop import train as run_training_loop
 
 load_dotenv()
+
+
+_INTERRUPTED = False
+
+
+def _cleanup_workers() -> None:
+    terminate_descendants(os.getpid())
+
+
+def _handle_signal(signum: int, _frame: Any) -> None:
+    global _INTERRUPTED
+    if _INTERRUPTED:
+        raise SystemExit(130)
+    _INTERRUPTED = True
+    _cleanup_workers()
+    raise KeyboardInterrupt(f"Received signal {signum}")
 
 
 def _as_plain(cfg: Any) -> Any:
@@ -94,4 +113,13 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _cleanup_workers()
+        raise SystemExit(130)
+    finally:
+        if _INTERRUPTED:
+            _cleanup_workers()
