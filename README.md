@@ -71,7 +71,8 @@ python scripts/run_experiment.py seed=7 runtime.out_dir=runs/seed7
 
 ## Multirun Sweeps
 
-By default, multirun uses Hydra Joblib launcher in parallel (`n_jobs=3`).
+By default, multirun uses the local Hydra Joblib composition
+(`hydra/launcher=local_joblib`) in parallel (`n_jobs=3`).
 You can override it per run with `hydra.launcher.n_jobs=<k>`.
 
 Default multirun launcher is Joblib. For GPU-aware auto-scaling of

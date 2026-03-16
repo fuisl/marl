@@ -7,7 +7,7 @@ defaults:
   - logger: default
   - runtime: default
   - optional experiment: null
-  - override hydra/launcher: joblib
+  - override hydra/launcher: local_joblib
   - _self_
 
 project: marl-traffic-gat
