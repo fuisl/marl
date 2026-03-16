@@ -75,7 +75,7 @@ def _validate_cfg(cfg: DictConfig) -> None:
         )
 
 
-def _run_training(cfg: DictConfig, env_cfg: dict[str, Any]) -> None:
+def _run_training(cfg: DictConfig, env_cfg: dict[str, Any]) -> dict[str, Any]:
     run_cfg = {
         "env": env_cfg,
         "model": _as_plain(cfg.model),
@@ -87,7 +87,10 @@ def _run_training(cfg: DictConfig, env_cfg: dict[str, Any]) -> None:
     }
     run_cfg["train"]["seed"] = int(cfg.seed)
     run_cfg["wandb"]["run_name"] = str(run_cfg["wandb"].get("run_name") or cfg.run_name)
-    run_training_loop(OmegaConf.create(run_cfg))
+    result = run_training_loop(OmegaConf.create(run_cfg))
+    if isinstance(result, dict):
+        return result
+    return {"interrupted": False}
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="run")
@@ -97,7 +100,9 @@ def main(cfg: DictConfig) -> None:
 
     trainer = str(cfg.algo.trainer)
     if trainer == "discrete_sac":
-        _run_training(cfg, env_cfg)
+        result = _run_training(cfg, env_cfg)
+        if bool(result.get("interrupted", False)):
+            raise KeyboardInterrupt("Training interrupted by signal")
         return
     if trainer == "fixed_time_baseline":
         run_baseline(

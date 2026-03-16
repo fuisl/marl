@@ -24,6 +24,7 @@ from __future__ import annotations
 import collections
 from collections.abc import Mapping
 import csv
+import json
 import os
 import random
 import time
@@ -356,12 +357,129 @@ def sac_update(
     }
 
 
+def _summarize_eval_metrics(all_metrics: list[dict[str, float]]) -> dict[str, float]:
+    if not all_metrics:
+        return {}
+
+    summary: dict[str, float] = {}
+    keys = list(all_metrics[0].keys())
+    for key in keys:
+        values = [float(m[key]) for m in all_metrics if key in m]
+        if not values:
+            continue
+        summary[f"PostTrain/Eval/{key} Mean"] = sum(values) / len(values)
+        summary[f"PostTrain/Eval/{key} Min"] = min(values)
+        summary[f"PostTrain/Eval/{key} Max"] = max(values)
+
+    summary["PostTrain/Eval/Episodes"] = float(len(all_metrics))
+    return summary
+
+
+def _postprocess_after_training(
+    cfg: DictConfig,
+    *,
+    checkpoint_path: Path,
+    out_dir: Path,
+    env_cfg: dict[str, Any],
+    model_cfg: dict[str, Any],
+    device: torch.device,
+    use_wandb: bool,
+) -> None:
+    post_cfg = maybe_to_container(cfg.train.get("postprocess", {})) or {}
+    run_eval = bool(post_cfg.get("run_evaluation", True))
+    run_visual = bool(post_cfg.get("run_visualization", True))
+
+    if not checkpoint_path.exists():
+        print(f"[postprocess] skip: checkpoint missing at {checkpoint_path}")
+        return
+
+    post_dir = out_dir / "postprocess"
+    post_dir.mkdir(parents=True, exist_ok=True)
+
+    if run_eval:
+        try:
+            from train.evaluate import evaluate as run_evaluation
+
+            eval_episodes = int(post_cfg.get("eval_episodes", 5))
+            eval_gui = bool(post_cfg.get("eval_gui", False))
+            eval_metrics = run_evaluation(
+                checkpoint_path=str(checkpoint_path),
+                env_cfg=dict(env_cfg),
+                model_cfg=dict(model_cfg),
+                n_episodes=eval_episodes,
+                device=str(device),
+                gui=eval_gui,
+            )
+
+            eval_file = post_dir / "eval_metrics.json"
+            eval_file.write_text(json.dumps(eval_metrics, indent=2), encoding="utf-8")
+            print(f"[postprocess] eval metrics saved -> {eval_file}")
+
+            if use_wandb:
+                summary = _summarize_eval_metrics(eval_metrics)
+                if summary:
+                    wandb.log(summary)
+                wandb.save(str(eval_file), base_path=str(out_dir))
+        except Exception as exc:  # pragma: no cover - integration/runtime dependent
+            print(f"[postprocess] evaluation failed: {exc}")
+
+    if run_visual:
+        try:
+            from visualization.graph_influence import run_visualization
+
+            viz_out_raw = post_cfg.get("visualization_out_dir", None)
+            viz_out_dir = resolve_repo_path(viz_out_raw) if viz_out_raw else (post_dir / "visualization")
+            viz_device = str(post_cfg.get("visualization_device", str(device)))
+
+            vis_summary = run_visualization(
+                checkpoint_path=checkpoint_path,
+                env_cfg=dict(env_cfg),
+                model_cfg=dict(model_cfg),
+                out_dir=viz_out_dir,
+                device=viz_device,
+                num_snapshots=int(post_cfg.get("visualization_num_snapshots", 5)),
+                max_hops=maybe_to_container(post_cfg.get("visualization_max_hops", None)),
+                curve_num_samples=maybe_to_container(post_cfg.get("visualization_curve_num_samples", None)),
+                map_num_samples=maybe_to_container(post_cfg.get("visualization_map_num_samples", None)),
+            )
+
+            print(f"[postprocess] visualization saved -> {viz_out_dir}")
+
+            if use_wandb:
+                wandb.log({
+                    "PostTrain/Visualization/Avg Receptive Field Breadth": float(
+                        vis_summary.get("avg_receptive_field_breadth", 0.0)
+                    ),
+                    "PostTrain/Visualization/Num Nodes": float(vis_summary.get("num_nodes", 0.0)),
+                    "PostTrain/Visualization/Num Undirected Edges": float(
+                        vis_summary.get("num_undirected_edges", 0.0)
+                    ),
+                })
+                artifacts = vis_summary.get("artifacts", {})
+                if isinstance(artifacts, dict):
+                    graph_path = Path(str(artifacts.get("graph_topology", "")))
+                    curve_path = Path(str(artifacts.get("influence_curve", "")))
+                    map_path = Path(str(artifacts.get("influence_map", "")))
+                    if graph_path.exists():
+                        wandb.log({"PostTrain/Visualization/Graph Topology": wandb.Image(str(graph_path))})
+                    if curve_path.exists():
+                        wandb.log({"PostTrain/Visualization/Influence Curve": wandb.Image(str(curve_path))})
+                    if map_path.exists():
+                        wandb.log({"PostTrain/Visualization/Influence Map": wandb.Image(str(map_path))})
+                    for artifact_path in artifacts.values():
+                        artifact_file = Path(str(artifact_path))
+                        if artifact_file.exists():
+                            wandb.save(str(artifact_file), base_path=str(out_dir))
+        except Exception as exc:  # pragma: no cover - integration/runtime dependent
+            print(f"[postprocess] visualization failed: {exc}")
+
+
 # ======================================================================
 # Training loop
 # ======================================================================
 
 
-def train(cfg: DictConfig) -> None:
+def train(cfg: DictConfig) -> dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = int(cfg.train.seed)
     base_optimizer_name = str(cfg.train.optimizer.name)
@@ -513,129 +631,170 @@ def train(cfg: DictConfig) -> None:
     return_history: collections.deque[float] = collections.deque(maxlen=50)
     last_metrics: dict[str, Any] = {}
     t0 = time.perf_counter()
+    interrupted = False
+    episodes_completed = 0
+    best_ckpt_path = out_dir / "best_agent.pt"
 
     print(f"\n{'Ep':>6}  {'Return':>10}  {'MA-50':>10}  {'CriticL':>9}"
           f"  {'ActorL':>9}  {'Entropy':>9}  {'Alpha':>7}  {'Trans':>7}")
     print("-" * 85)
 
-    for ep in range(1, int(cfg.train.episodes) + 1):
-        agent.train()
-        transitions, ep_return, ep_steps, validation_metrics = run_episode(env, agent, device)
+    try:
+        for ep in range(1, int(cfg.train.episodes) + 1):
+            agent.train()
+            transitions, ep_return, ep_steps, validation_metrics = run_episode(env, agent, device)
 
-        for t in transitions:
-            replay.push(t)
-        total_transitions += len(transitions)
+            for t in transitions:
+                replay.push(t)
+            total_transitions += len(transitions)
 
-        return_history.append(ep_return)
-        ma50 = sum(return_history) / len(return_history)
-        return_per_agent_step = ep_return / max(ep_steps * n_agents, 1)
+            return_history.append(ep_return)
+            ma50 = sum(return_history) / len(return_history)
+            return_per_agent_step = ep_return / max(ep_steps * n_agents, 1)
 
-        # --- Gradient updates (one per new transition, after warmup) ---
-        if total_transitions >= int(cfg.train.warmup):
-            for _ in range(len(transitions) * int(cfg.train.updates_per_step)):
-                m = sac_update(loss_fn, replay, optimizers, int(cfg.train.batch_size), device)
-                if m is not None:
-                    last_metrics = m
-            agent.soft_update_target()
+            # --- Gradient updates (one per new transition, after warmup) ---
+            if total_transitions >= int(cfg.train.warmup):
+                for _ in range(len(transitions) * int(cfg.train.updates_per_step)):
+                    m = sac_update(loss_fn, replay, optimizers, int(cfg.train.batch_size), device)
+                    if m is not None:
+                        last_metrics = m
+                agent.soft_update_target()
 
-        # --- Checkpoint ---
-        if ep_return > best_return:
-            best_return = ep_return
-            torch.save(agent.state_dict(), out_dir / "best_agent.pt")
+            # --- Checkpoint ---
+            if ep_return > best_return:
+                best_return = ep_return
+                torch.save(agent.state_dict(), best_ckpt_path)
 
-        # --- Log CSV ---
-        elapsed = time.perf_counter() - t0
-        row: dict[str, Any] = {
-            "episode":           ep,
-            "n_steps":           ep_steps,
-            "return":            round(ep_return, 3),
-            "return_ma50":       round(ma50, 3),
-            "return_per_agent_step": round(return_per_agent_step, 6),
-            "traffic_avg_travel_time_s": round(validation_metrics["avg_travel_time_s"], 4),
-            "traffic_avg_delay_s": round(validation_metrics["avg_delay_s"], 4),
-            "traffic_avg_queue_length": round(validation_metrics["avg_queue_length"], 4),
-            "val_avg_speed_mps": round(validation_metrics["avg_speed_mps"], 4),
-            "val_avg_occupancy_pct": round(validation_metrics["avg_occupancy_pct"], 4),
-            "val_avg_min_expected_vehicles": round(validation_metrics["avg_min_expected_vehicles"], 4),
-            "traffic_network_total_waiting_s": round(validation_metrics["avg_network_waiting_s_per_decision"], 4),
-            "traffic_network_total_vehicles": round(validation_metrics["avg_network_vehicles_per_decision"], 4),
-            "val_total_arrived_vehicles": round(validation_metrics["total_arrived_vehicles"], 2),
-            "val_total_departed_vehicles": round(validation_metrics["total_departed_vehicles"], 2),
-            "val_total_teleported_vehicles": round(validation_metrics["total_teleported_vehicles"], 2),
-            "total_transitions": total_transitions,
-            "elapsed_s":         round(elapsed, 1),
-            **{k: round(float(v), 5) for k, v in last_metrics.items()},
-        }
-        writer.writerow(row)
-        log_f.flush()
+            # --- Log CSV ---
+            elapsed = time.perf_counter() - t0
+            row: dict[str, Any] = {
+                "episode":           ep,
+                "n_steps":           ep_steps,
+                "return":            round(ep_return, 3),
+                "return_ma50":       round(ma50, 3),
+                "return_per_agent_step": round(return_per_agent_step, 6),
+                "traffic_avg_travel_time_s": round(validation_metrics["avg_travel_time_s"], 4),
+                "traffic_avg_delay_s": round(validation_metrics["avg_delay_s"], 4),
+                "traffic_avg_queue_length": round(validation_metrics["avg_queue_length"], 4),
+                "val_avg_speed_mps": round(validation_metrics["avg_speed_mps"], 4),
+                "val_avg_occupancy_pct": round(validation_metrics["avg_occupancy_pct"], 4),
+                "val_avg_min_expected_vehicles": round(validation_metrics["avg_min_expected_vehicles"], 4),
+                "traffic_network_total_waiting_s": round(validation_metrics["avg_network_waiting_s_per_decision"], 4),
+                "traffic_network_total_vehicles": round(validation_metrics["avg_network_vehicles_per_decision"], 4),
+                "val_total_arrived_vehicles": round(validation_metrics["total_arrived_vehicles"], 2),
+                "val_total_departed_vehicles": round(validation_metrics["total_departed_vehicles"], 2),
+                "val_total_teleported_vehicles": round(validation_metrics["total_teleported_vehicles"], 2),
+                "total_transitions": total_transitions,
+                "elapsed_s":         round(elapsed, 1),
+                **{k: round(float(v), 5) for k, v in last_metrics.items()},
+            }
+            writer.writerow(row)
+            log_f.flush()
 
-        # --- W&B ---
-        if use_wandb:
-            wandb.log({
-                # Common x-axis
-                "Episode": ep,
+            # --- W&B ---
+            if use_wandb:
+                wandb.log({
+                    # Common x-axis
+                    "Episode": ep,
 
-                # Learning metrics
-                "Learning/Reward": ep_return,
-                "Learning/Reward (MA50)": ma50,
-                "Learning/Reward Per Agent-Step": return_per_agent_step,
-                "Learning/Episode Length (steps)": ep_steps,
-                "Learning/Total Transitions": total_transitions,
-                "Learning/Elapsed Time (s)": elapsed,
-                "Learning/Critic Loss": last_metrics.get("critic_loss", float("nan")),
-                "Learning/Actor Loss": last_metrics.get("actor_loss", float("nan")),
-                "Learning/Alpha Loss": last_metrics.get("alpha_loss", float("nan")),
-                "Learning/Q1 Mean": last_metrics.get("q1", float("nan")),
-                "Learning/Q2 Mean": last_metrics.get("q2", float("nan")),
-                "Learning/Policy Entropy": last_metrics.get("entropy", float("nan")),
-                "Learning/Alpha": last_metrics.get("alpha", float("nan")),
-                "Learning/Best Reward": best_return,
+                    # Learning metrics
+                    "Learning/Reward": ep_return,
+                    "Learning/Reward (MA50)": ma50,
+                    "Learning/Reward Per Agent-Step": return_per_agent_step,
+                    "Learning/Episode Length (steps)": ep_steps,
+                    "Learning/Total Transitions": total_transitions,
+                    "Learning/Elapsed Time (s)": elapsed,
+                    "Learning/Critic Loss": last_metrics.get("critic_loss", float("nan")),
+                    "Learning/Actor Loss": last_metrics.get("actor_loss", float("nan")),
+                    "Learning/Alpha Loss": last_metrics.get("alpha_loss", float("nan")),
+                    "Learning/Q1 Mean": last_metrics.get("q1", float("nan")),
+                    "Learning/Q2 Mean": last_metrics.get("q2", float("nan")),
+                    "Learning/Policy Entropy": last_metrics.get("entropy", float("nan")),
+                    "Learning/Alpha": last_metrics.get("alpha", float("nan")),
+                    "Learning/Best Reward": best_return,
 
-                # Traffic metrics (truthful names to match implemented formulas)
-                "Traffic/Average Travel Time (s)": validation_metrics["avg_travel_time_s"],
-                "Traffic/Average Waiting Time (s)": validation_metrics["avg_delay_s"],
-                "Traffic/Average Delay Proxy (s)": validation_metrics["avg_delay_s"],
-                "Traffic/Average Queue Length": validation_metrics["avg_queue_length"],
-                "Traffic/Average Speed (m/s)": validation_metrics["avg_speed_mps"],
-                "Traffic/Average Occupancy (%)": validation_metrics["avg_occupancy_pct"],
-                "Traffic/Average Min Expected Vehicles": validation_metrics["avg_min_expected_vehicles"],
-                "Traffic/Average Network Waiting (veh*s per decision)": validation_metrics["avg_network_waiting_s_per_decision"],
-                "Traffic/Average Network Vehicles (per decision)": validation_metrics["avg_network_vehicles_per_decision"],
-                "Traffic/Arrived Vehicles": validation_metrics["total_arrived_vehicles"],
-                "Traffic/Departed Vehicles": validation_metrics["total_departed_vehicles"],
-                "Traffic/Teleported Vehicles": validation_metrics["total_teleported_vehicles"],
+                    # Traffic metrics (truthful names to match implemented formulas)
+                    "Traffic/Average Travel Time (s)": validation_metrics["avg_travel_time_s"],
+                    "Traffic/Average Waiting Time (s)": validation_metrics["avg_delay_s"],
+                    "Traffic/Average Delay Proxy (s)": validation_metrics["avg_delay_s"],
+                    "Traffic/Average Queue Length": validation_metrics["avg_queue_length"],
+                    "Traffic/Average Speed (m/s)": validation_metrics["avg_speed_mps"],
+                    "Traffic/Average Occupancy (%)": validation_metrics["avg_occupancy_pct"],
+                    "Traffic/Average Min Expected Vehicles": validation_metrics["avg_min_expected_vehicles"],
+                    "Traffic/Average Network Waiting (veh*s per decision)": validation_metrics["avg_network_waiting_s_per_decision"],
+                    "Traffic/Average Network Vehicles (per decision)": validation_metrics["avg_network_vehicles_per_decision"],
+                    "Traffic/Arrived Vehicles": validation_metrics["total_arrived_vehicles"],
+                    "Traffic/Departed Vehicles": validation_metrics["total_departed_vehicles"],
+                    "Traffic/Teleported Vehicles": validation_metrics["total_teleported_vehicles"],
 
-                # RESCO-compatible aliases for easier cross-plotting
-                "RESCO/duration": validation_metrics["avg_travel_time_s"],
-                "RESCO/waitingTime": validation_metrics["avg_delay_s"],
-                "RESCO/timeLoss_proxy": validation_metrics["avg_delay_s"],
-                "RESCO/queue_lengths": validation_metrics["avg_queue_length"],
-                "RESCO/rewards": ep_return,
-                "RESCO/vehicles": validation_metrics["total_departed_vehicles"],
-            })
+                    # RESCO-compatible aliases for easier cross-plotting
+                    "RESCO/duration": validation_metrics["avg_travel_time_s"],
+                    "RESCO/waitingTime": validation_metrics["avg_delay_s"],
+                    "RESCO/timeLoss_proxy": validation_metrics["avg_delay_s"],
+                    "RESCO/queue_lengths": validation_metrics["avg_queue_length"],
+                    "RESCO/rewards": ep_return,
+                    "RESCO/vehicles": validation_metrics["total_departed_vehicles"],
+                })
 
-        # --- Console ---
-        if ep % int(cfg.train.log_interval) == 0 or ep == 1:
-            cl = last_metrics.get("critic_loss", float("nan"))
-            al = last_metrics.get("actor_loss",  float("nan"))
-            en = last_metrics.get("entropy",     float("nan"))
-            a  = last_metrics.get("alpha",       float("nan"))
-            warm_tag = "" if total_transitions >= int(cfg.train.warmup) else " [warmup]"
-            print(
-                f"{ep:6d}  {ep_return:10.2f}  {ma50:10.2f}"
-                f"  {cl:9.4f}  {al:9.4f}  {en:9.4f}  {a:7.4f}"
-                f"  {total_transitions:7d}{warm_tag}"
-            )
+            # --- Console ---
+            if ep % int(cfg.train.log_interval) == 0 or ep == 1:
+                cl = last_metrics.get("critic_loss", float("nan"))
+                al = last_metrics.get("actor_loss",  float("nan"))
+                en = last_metrics.get("entropy",     float("nan"))
+                a  = last_metrics.get("alpha",       float("nan"))
+                warm_tag = "" if total_transitions >= int(cfg.train.warmup) else " [warmup]"
+                print(
+                    f"{ep:6d}  {ep_return:10.2f}  {ma50:10.2f}"
+                    f"  {cl:9.4f}  {al:9.4f}  {en:9.4f}  {a:7.4f}"
+                    f"  {total_transitions:7d}{warm_tag}"
+                )
+            episodes_completed = ep
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nTraining interrupted. Finalizing and running post-processing...")
+        if not best_ckpt_path.exists():
+            torch.save(agent.state_dict(), best_ckpt_path)
+            print(f"[interrupt] checkpoint saved -> {best_ckpt_path}")
+    finally:
+        log_f.close()
+        env.close()
 
-    log_f.close()
-    env.close()
+    post_cfg = maybe_to_container(cfg.train.get("postprocess", {})) or {}
+    post_enabled = bool(post_cfg.get("enabled", True))
+    run_on_complete = bool(post_cfg.get("on_complete", True))
+    run_on_interrupt = bool(post_cfg.get("on_interrupt", True))
+    should_postprocess = post_enabled and ((interrupted and run_on_interrupt) or ((not interrupted) and run_on_complete))
+
+    if should_postprocess:
+        _postprocess_after_training(
+            cfg,
+            checkpoint_path=best_ckpt_path,
+            out_dir=out_dir,
+            env_cfg=maybe_to_container(cfg.env),
+            model_cfg=maybe_to_container(cfg.model),
+            device=device,
+            use_wandb=use_wandb,
+        )
 
     if use_wandb:
-        wandb.save(str(out_dir / "best_agent.pt"), base_path=str(out_dir))
+        if best_ckpt_path.exists():
+            wandb.save(str(best_ckpt_path), base_path=str(out_dir))
+        run_obj = wandb.run
+        if run_obj is not None:
+            run_obj.summary["interrupted"] = bool(interrupted)
+            run_obj.summary["episodes_completed"] = int(episodes_completed)
+            run_obj.summary["best_return"] = float(best_return)
         wandb.finish()
 
     print("-" * 85)
     print(f"\nDone.  Best return: {best_return:.2f}")
-    print(f"  checkpoint → {out_dir / 'best_agent.pt'}")
+    print(f"  checkpoint → {best_ckpt_path}")
     print(f"  log        → {log_path}")
+
+    return {
+        "interrupted": interrupted,
+        "episodes_completed": episodes_completed,
+        "best_checkpoint": str(best_ckpt_path),
+        "out_dir": str(out_dir),
+    }
 
