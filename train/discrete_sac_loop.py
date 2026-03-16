@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from config_utils import load_dotenv, maybe_to_container, resolve_repo_path
 

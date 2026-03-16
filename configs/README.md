@@ -107,6 +107,18 @@ This avoids duplicating giant monolithic configs and makes sweeps natural.
 
 ## How to run
 
+`configs/run.yaml` sets multirun launcher to `hydra/launcher=joblib` by default,
+so `-m` sweeps run in parallel.
+
+Default parallel workers are in `configs/hydra/launcher/joblib.yaml`.
+`n_jobs` is read from `HYDRA_N_JOBS` (default `3`).
+
+Override options:
+
+- CLI: `hydra.launcher.n_jobs=2`
+- Env var: `HYDRA_N_JOBS=2`
+- Auto GPU scaling helper: `python scripts/run_sweep.py ...`
+
 Single run with defaults:
 
 ```bash

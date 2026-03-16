@@ -4,11 +4,11 @@ action_space: discrete
 obs_space: graph
 
 common:
-  delta_t: 10
+  delta_t: 5
   sumo_binary: sumo
   gui: false
   additional_files: null
-  graph_builder_mode: original
+  graph_builder_mode: all_intersections
 
   reward_mode: pressure_queue
   reward_weights:

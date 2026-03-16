@@ -1,0 +1,8 @@
+name: ingolstadt1
+
+env_params:
+  net_file: nets/ingolstadt1/ingolstadt1.net.xml
+  route_file: nets/ingolstadt1/ingolstadt1.rou.xml
+  begin_time: 57600
+  end_time: 61200
+  delta_t: 5

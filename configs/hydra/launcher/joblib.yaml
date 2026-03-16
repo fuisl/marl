@@ -1,0 +1,7 @@
+# Default parallel launcher for Hydra multirun jobs.
+# This launcher only affects `-m` sweeps.
+_target_: hydra_plugins.hydra_joblib_launcher.joblib_launcher.JoblibLauncher
+n_jobs: ${oc.decode:${oc.env:HYDRA_N_JOBS,3}}
+backend: loky
+prefer: processes
+verbose: 0
