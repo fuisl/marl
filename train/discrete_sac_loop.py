@@ -292,8 +292,9 @@ def run_episode(
         "avg_speed_mps": metric_sums["avg_speed_mps"] / max(n_decisions, 1),
         "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(n_decisions, 1),
         "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(n_decisions, 1),
-        "network_total_waiting_s": metric_sums["network_total_waiting_s"] / max(n_decisions, 1),
-        "network_total_vehicles": metric_sums["network_total_vehicles"] / max(n_decisions, 1),
+        # These are decision-time averages of network totals, not episode totals.
+        "avg_network_waiting_s_per_decision": metric_sums["network_total_waiting_s"] / max(n_decisions, 1),
+        "avg_network_vehicles_per_decision": metric_sums["network_total_vehicles"] / max(n_decisions, 1),
         "total_arrived_vehicles": metric_sums["arrived_vehicles"],
         "total_departed_vehicles": metric_sums["departed_vehicles"],
         "total_teleported_vehicles": metric_sums["teleported_vehicles"],
@@ -458,10 +459,11 @@ def train(cfg: DictConfig) -> None:
             dir=str(out_dir),
             tags=["gat", "discrete-sac", "marl", "sumo-5x5", actor_opt_name, critic_opt_name, reward_mode],
         )
-        wandb.define_metric("train/episode")
-        wandb.define_metric("train/*", step_metric="train/episode")
-        wandb.define_metric("traffic/*", step_metric="train/episode")
-        wandb.define_metric("debug/*", step_metric="train/episode")
+        wandb.define_metric("Episode")
+        wandb.define_metric("Learning/*", step_metric="Episode")
+        wandb.define_metric("Traffic/*", step_metric="Episode")
+        wandb.define_metric("RESCO/*", step_metric="Episode")
+        wandb.define_metric("Debug/*", step_metric="Episode")
 
         run_metadata = {
             "device": str(device),
@@ -555,8 +557,8 @@ def train(cfg: DictConfig) -> None:
             "val_avg_speed_mps": round(validation_metrics["avg_speed_mps"], 4),
             "val_avg_occupancy_pct": round(validation_metrics["avg_occupancy_pct"], 4),
             "val_avg_min_expected_vehicles": round(validation_metrics["avg_min_expected_vehicles"], 4),
-            "traffic_network_total_waiting_s": round(validation_metrics["network_total_waiting_s"], 4),
-            "traffic_network_total_vehicles": round(validation_metrics["network_total_vehicles"], 4),
+            "traffic_network_total_waiting_s": round(validation_metrics["avg_network_waiting_s_per_decision"], 4),
+            "traffic_network_total_vehicles": round(validation_metrics["avg_network_vehicles_per_decision"], 4),
             "val_total_arrived_vehicles": round(validation_metrics["total_arrived_vehicles"], 2),
             "val_total_departed_vehicles": round(validation_metrics["total_departed_vehicles"], 2),
             "val_total_teleported_vehicles": round(validation_metrics["total_teleported_vehicles"], 2),
@@ -570,33 +572,46 @@ def train(cfg: DictConfig) -> None:
         # --- W&B ---
         if use_wandb:
             wandb.log({
-                # Preferred descriptive names
-                "train/episode":               ep,
-                "train/episode_return":        ep_return,
-                "train/episode_return_ma50":   ma50,
-                "train/return_per_agent_step": return_per_agent_step,
-                "train/episode_steps":         ep_steps,
-                "train/total_transitions":     total_transitions,
-                "train/elapsed_s":             elapsed,
-                "train/loss_critic":           last_metrics.get("critic_loss", float("nan")),
-                "train/loss_actor":            last_metrics.get("actor_loss",  float("nan")),
-                "train/loss_alpha":            last_metrics.get("alpha_loss",  float("nan")),
-                "train/q1_mean":               last_metrics.get("q1",          float("nan")),
-                "train/q2_mean":               last_metrics.get("q2",          float("nan")),
-                "train/policy_entropy":        last_metrics.get("entropy",     float("nan")),
-                "train/alpha":                 last_metrics.get("alpha",       float("nan")),
-                "train/best_episode_return":   best_return,
-                "traffic/avg_travel_time_s": validation_metrics["avg_travel_time_s"],
-                "traffic/avg_delay_s": validation_metrics["avg_delay_s"],
-                "traffic/avg_queue_length": validation_metrics["avg_queue_length"],
-                "traffic/avg_speed_mps": validation_metrics["avg_speed_mps"],
-                "traffic/avg_occupancy_pct": validation_metrics["avg_occupancy_pct"],
-                "traffic/avg_min_expected_vehicles": validation_metrics["avg_min_expected_vehicles"],
-                "traffic/network_total_waiting_s": validation_metrics["network_total_waiting_s"],
-                "traffic/network_total_vehicles": validation_metrics["network_total_vehicles"],
-                "traffic/throughput_arrived_vehicles": validation_metrics["total_arrived_vehicles"],
-                "traffic/flow_departed_vehicles": validation_metrics["total_departed_vehicles"],
-                "traffic/teleported_vehicles": validation_metrics["total_teleported_vehicles"],
+                # Common x-axis
+                "Episode": ep,
+
+                # Learning metrics
+                "Learning/Reward": ep_return,
+                "Learning/Reward (MA50)": ma50,
+                "Learning/Reward Per Agent-Step": return_per_agent_step,
+                "Learning/Episode Length (steps)": ep_steps,
+                "Learning/Total Transitions": total_transitions,
+                "Learning/Elapsed Time (s)": elapsed,
+                "Learning/Critic Loss": last_metrics.get("critic_loss", float("nan")),
+                "Learning/Actor Loss": last_metrics.get("actor_loss", float("nan")),
+                "Learning/Alpha Loss": last_metrics.get("alpha_loss", float("nan")),
+                "Learning/Q1 Mean": last_metrics.get("q1", float("nan")),
+                "Learning/Q2 Mean": last_metrics.get("q2", float("nan")),
+                "Learning/Policy Entropy": last_metrics.get("entropy", float("nan")),
+                "Learning/Alpha": last_metrics.get("alpha", float("nan")),
+                "Learning/Best Reward": best_return,
+
+                # Traffic metrics (truthful names to match implemented formulas)
+                "Traffic/Average Travel Time (s)": validation_metrics["avg_travel_time_s"],
+                "Traffic/Average Waiting Time (s)": validation_metrics["avg_delay_s"],
+                "Traffic/Average Delay Proxy (s)": validation_metrics["avg_delay_s"],
+                "Traffic/Average Queue Length": validation_metrics["avg_queue_length"],
+                "Traffic/Average Speed (m/s)": validation_metrics["avg_speed_mps"],
+                "Traffic/Average Occupancy (%)": validation_metrics["avg_occupancy_pct"],
+                "Traffic/Average Min Expected Vehicles": validation_metrics["avg_min_expected_vehicles"],
+                "Traffic/Average Network Waiting (veh*s per decision)": validation_metrics["avg_network_waiting_s_per_decision"],
+                "Traffic/Average Network Vehicles (per decision)": validation_metrics["avg_network_vehicles_per_decision"],
+                "Traffic/Arrived Vehicles": validation_metrics["total_arrived_vehicles"],
+                "Traffic/Departed Vehicles": validation_metrics["total_departed_vehicles"],
+                "Traffic/Teleported Vehicles": validation_metrics["total_teleported_vehicles"],
+
+                # RESCO-compatible aliases for easier cross-plotting
+                "RESCO/duration": validation_metrics["avg_travel_time_s"],
+                "RESCO/waitingTime": validation_metrics["avg_delay_s"],
+                "RESCO/timeLoss_proxy": validation_metrics["avg_delay_s"],
+                "RESCO/queue_lengths": validation_metrics["avg_queue_length"],
+                "RESCO/rewards": ep_return,
+                "RESCO/vehicles": validation_metrics["total_departed_vehicles"],
             })
 
         # --- Console ---
