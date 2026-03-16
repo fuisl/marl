@@ -1,0 +1,4 @@
+out_dir: runs/${run_name}
+
+# Optional runtime override for SUMO GUI. Set null to keep env/scenario value.
+gui: null

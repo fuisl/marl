@@ -1,0 +1,5 @@
+wandb:
+  enabled: false
+  project: marl-traffic
+  run_name: ${run_name}
+  log_model: false

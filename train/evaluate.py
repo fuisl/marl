@@ -1,8 +1,8 @@
-"""Evaluation script — run a trained agent on SUMO and report traffic metrics.
+"""Evaluation script — run a trained raw-loop agent on SUMO and report metrics.
 
 Usage::
 
-    python -m train.evaluate runtime.checkpoint_path=runs/lightning_train/checkpoints/last.ckpt
+    python -m train.evaluate runtime.checkpoint_path=runs/gat_baseline/best_agent.pt
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ from config_utils import load_dotenv, resolve_repo_path
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 from rl.rollout import RolloutWorker
-from train.lightning_module import TrafficMARLModule
 
 load_dotenv()
 
@@ -41,16 +40,20 @@ def evaluate(
     # Override GUI setting for visual evaluation
     env_cfg = {**env_cfg, "gui": gui}
 
-    module = TrafficMARLModule.load_from_checkpoint(
-        checkpoint_path,
-        env_cfg=env_cfg,
-        model_cfg=model_cfg,
-    )
-    agent: MARLDiscreteSAC = module.agent  # type: ignore[assignment]
-    agent = agent.to(device)
+    env = TrafficSignalEnv(**env_cfg)
+    td0 = env.reset()
+    obs_dim = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
+    num_actions = int(env.num_actions)
+
+    agent = MARLDiscreteSAC(
+        obs_dim=obs_dim,
+        num_actions=num_actions,
+        **model_cfg,
+    ).to(device)
+    state_dict = torch.load(checkpoint_path, map_location=device)
+    agent.load_state_dict(state_dict)
     agent.eval()
 
-    env = TrafficSignalEnv(**env_cfg)
     worker = RolloutWorker(env=env, agent=agent, device=device)
 
     all_metrics: list[dict[str, float]] = []

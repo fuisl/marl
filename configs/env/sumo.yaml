@@ -1,0 +1,20 @@
+name: sumo_traffic
+family: sumo
+action_space: discrete
+obs_space: graph
+
+common:
+  delta_t: 10
+  sumo_binary: sumo
+  gui: false
+  additional_files: null
+  graph_builder_mode: original
+
+  reward_mode: pressure_queue
+  reward_weights:
+    pressure: 1.0
+    queue: 0.1
+
+  yellow_duration: 3
+  all_red_duration: 2
+  min_green_duration: 10

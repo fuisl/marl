@@ -2,7 +2,7 @@
 
 Implements the three SAC losses (critic, actor, alpha) using the
 graph-based encoder for state representation.  Designed to work with
-manual optimization in PyTorch Lightning.
+raw custom training loops.
 """
 
 from __future__ import annotations

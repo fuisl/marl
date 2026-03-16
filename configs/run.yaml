@@ -1,0 +1,21 @@
+defaults:
+  - env: sumo
+  - scenario: grid5x5
+  - algo: discrete_sac
+  - model: default
+  - train: default
+  - logger: default
+  - runtime: default
+  - optional experiment: null
+  - _self_
+
+project: marl-traffic
+seed: 42
+run_name: ${algo.name}_${scenario.name}_seed${seed}
+
+tags: []
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

@@ -1,0 +1,10 @@
+name: berlin
+
+env_params:
+  net_file: nets/berlin/berlin.net.xml
+  route_file: nets/berlin/berlin.rou.gz,nets/berlin/berlin_bus.rou.xml
+  additional_files:
+    - nets/berlin/berlin_bus_stops.add.xml
+  begin_time: 25200
+  end_time: 28800
+  delta_t: 5

@@ -1,0 +1,7 @@
+name: arterial4x4
+
+env_params:
+  net_file: nets/arterial4x4/arterial4x4.net.xml
+  route_file: nets/arterial4x4/arterial4x4_1.rou.xml
+  begin_time: 0
+  end_time: 3600

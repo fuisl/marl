@@ -11,14 +11,13 @@ flowchart TB
   Hydra[Hydra Configs\nconfigs/*.yaml]
 
   subgraph EntryPoints[Entry Points]
+    RunExp[scripts/run_experiment.py]
     GATBaseline[scripts/train_gat_baseline.py]
-    LightningTrain[train/train.py]
     Eval[train/evaluate.py]
     SUMOBaseline[scripts/run_sumo_baseline.py]
   end
 
   subgraph TrainStack[Training Stack]
-    Lightning[TrafficMARLModule\ntrain/lightning_module.py]
     ManualLoop[Manual SAC Loop\nReplay + Update\nscripts/train_gat_baseline.py]
     Rollout[RolloutWorker\nrl/rollout.py]
     Replay[TensorDictReplayBuffer\nrl/replay.py]
@@ -43,20 +42,16 @@ flowchart TB
 
   SUMO[SUMO Simulator\nTraCI or libsumo]
 
+  Hydra --> RunExp
   Hydra --> GATBaseline
-  Hydra --> LightningTrain
   Hydra --> Eval
   Hydra --> SUMOBaseline
 
+  RunExp --> GATBaseline
+  RunExp --> SUMOBaseline
   GATBaseline --> ManualLoop
-  LightningTrain --> Lightning
-  Eval --> Lightning
+  Eval --> Agent
   SUMOBaseline --> Env
-
-  Lightning --> Rollout
-  Lightning --> Replay
-  Lightning --> Loss
-  Lightning --> Agent
 
   ManualLoop --> Replay
   ManualLoop --> Loss

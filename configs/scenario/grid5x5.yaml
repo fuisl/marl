@@ -1,0 +1,7 @@
+name: grid5x5
+
+env_params:
+  net_file: nets/grid5x5/grid5x5.net.xml
+  route_file: nets/grid5x5/grid5x5.rou.xml
+  begin_time: 0
+  end_time: 3600

@@ -1,0 +1,8 @@
+name: cologne3
+
+env_params:
+  net_file: nets/cologne3/cologne3.net.xml
+  route_file: nets/cologne3/cologne3.rou.xml
+  begin_time: 25200
+  end_time: 28800
+  delta_t: 5
