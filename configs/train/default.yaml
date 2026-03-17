@@ -42,6 +42,13 @@ optimizer_alpha:
   weight_decay: 0.0
   amsgrad: false
 
+critic_stability:
+  use_huber_loss: false
+  huber_delta: 1.0
+  clip_target_q: false
+  target_q_min: -100.0
+  target_q_max: 100.0
+
 postprocess:
   enabled: true
   on_complete: true

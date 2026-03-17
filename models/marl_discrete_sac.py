@@ -8,6 +8,7 @@ compatible with TorchRL's TensorDict-based loss computation.
 from __future__ import annotations
 
 import copy
+import math
 
 import torch
 import torch.nn as nn
@@ -85,7 +86,8 @@ class MARLDiscreteSAC(nn.Module):
         self.log_alpha = nn.Parameter(
             torch.tensor(init_alpha, dtype=torch.float32).log()
         )
-        self.target_entropy = -float(num_actions) * 0.98  # heuristic
+        # Discrete SAC target entropy should be near log(|A|), not negative.
+        self.target_entropy = 0.98 * math.log(float(max(num_actions, 2)))
 
         self.tau = tau
 

@@ -346,6 +346,8 @@ def sac_update(
     out.alpha_loss.backward()
     optimizers["alpha"].step()
 
+    loss_fn.agent.soft_update_target()
+
     return {
         "critic_loss": out.critic_loss.item(),
         "actor_loss":  out.actor_loss.item(),
@@ -557,7 +559,16 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     critic_opt_name = str(optim_critic_cfg.get("name", base_optimizer_name))
 
     # --- Loss & Replay ---
-    loss_fn = DiscreteSACLossComputer(agent, gamma=float(cfg.train.gamma))
+    critic_stability_cfg = maybe_to_container(cfg.train.get("critic_stability", {})) or {}
+    loss_fn = DiscreteSACLossComputer(
+        agent,
+        gamma=float(cfg.train.gamma),
+        use_huber_loss=bool(critic_stability_cfg.get("use_huber_loss", False)),
+        huber_delta=float(critic_stability_cfg.get("huber_delta", 1.0)),
+        clip_target_q=bool(critic_stability_cfg.get("clip_target_q", False)),
+        target_q_min=float(critic_stability_cfg.get("target_q_min", -1000.0)),
+        target_q_max=float(critic_stability_cfg.get("target_q_max", 1000.0)),
+    )
     replay  = ReplayBuffer(int(cfg.train.replay_capacity), seed=seed)
 
     # --- W&B ---
@@ -658,7 +669,6 @@ def train(cfg: DictConfig) -> dict[str, Any]:
                     m = sac_update(loss_fn, replay, optimizers, int(cfg.train.batch_size), device)
                     if m is not None:
                         last_metrics = m
-                agent.soft_update_target()
 
             # --- Checkpoint ---
             if ep_return > best_return:

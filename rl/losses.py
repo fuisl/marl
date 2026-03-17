@@ -46,9 +46,24 @@ class DiscreteSACLossComputer:
         Discount factor.
     """
 
-    def __init__(self, agent: MARLDiscreteSAC, gamma: float = 0.99) -> None:
+    def __init__(
+        self,
+        agent: MARLDiscreteSAC,
+        gamma: float = 0.99,
+        *,
+        use_huber_loss: bool = False,
+        huber_delta: float = 1.0,
+        clip_target_q: bool = False,
+        target_q_min: float = -1_000.0,
+        target_q_max: float = 1_000.0,
+    ) -> None:
         self.agent = agent
         self.gamma = gamma
+        self.use_huber_loss = bool(use_huber_loss)
+        self.huber_delta = float(huber_delta)
+        self.clip_target_q = bool(clip_target_q)
+        self.target_q_min = float(target_q_min)
+        self.target_q_max = float(target_q_max)
 
     def __call__(self, batch: TensorDict) -> SACLossOutput:
         return self.compute(batch)
@@ -187,11 +202,25 @@ class DiscreteSACLossComputer:
             v_next = (next_probs * (tq_min - alpha * next_log_probs)).sum(dim=-1, keepdim=True)
 
             target = rewards + (1.0 - dones) * self.gamma * v_next
+            if self.clip_target_q:
+                target = target.clamp(min=self.target_q_min, max=self.target_q_max)
 
-        loss = 0.5 * (
-            torch.nn.functional.mse_loss(q1, target)
-            + torch.nn.functional.mse_loss(q2, target)
-        )
+        if self.use_huber_loss:
+            loss_q1 = torch.nn.functional.huber_loss(
+                q1,
+                target,
+                delta=self.huber_delta,
+            )
+            loss_q2 = torch.nn.functional.huber_loss(
+                q2,
+                target,
+                delta=self.huber_delta,
+            )
+        else:
+            loss_q1 = torch.nn.functional.mse_loss(q1, target)
+            loss_q2 = torch.nn.functional.mse_loss(q2, target)
+
+        loss = 0.5 * (loss_q1 + loss_q2)
         return loss, q1.mean().item(), q2.mean().item()
 
     def _actor_loss(
@@ -239,7 +268,7 @@ class DiscreteSACLossComputer:
 
     def _alpha_loss(self, entropy: float) -> Tensor:
         """Adaptive temperature loss."""
-        return -(
+        return (
             self.agent.log_alpha * (entropy - self.agent.target_entropy)
         ).mean()
 
