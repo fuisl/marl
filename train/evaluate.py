@@ -52,8 +52,6 @@ def evaluate(
     agent.eval()
 
     avg_metric_keys = (
-        "avg_delay_s",
-        "avg_queue_length",
         "avg_speed_mps",
         "avg_occupancy_pct",
         "min_expected_vehicles",
@@ -104,9 +102,12 @@ def evaluate(
         enriched_info = {
             "episode_return": total_reward,
             "episode_length": float(steps),
+            # Benchmark-accurate per-completed-vehicle metrics (NeurIPS RESCO)
             "avg_travel_time_s": float(episode_kpis.get("avg_travel_time_s", 0.0)),
-            "avg_delay_s": metric_sums["avg_delay_s"] / max(steps, 1),
-            "avg_queue_length": metric_sums["avg_queue_length"] / max(steps, 1),
+            "avg_wait_s":         float(episode_kpis.get("avg_wait_s", 0.0)),
+            "avg_delay_s":        float(episode_kpis.get("avg_delay_s", 0.0)),
+            "avg_queue_length":   float(episode_kpis.get("avg_queue_length", 0.0)),
+            # Interval-averaged monitoring stats
             "avg_speed_mps": metric_sums["avg_speed_mps"] / max(steps, 1),
             "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(steps, 1),
             "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(steps, 1),
@@ -125,12 +126,16 @@ def evaluate(
     avg_return = sum(m["episode_return"] for m in all_metrics) / n_episodes
     avg_length = sum(m["episode_length"] for m in all_metrics) / n_episodes
     avg_travel_time = sum(m["avg_travel_time_s"] for m in all_metrics) / n_episodes
+    avg_wait = sum(m["avg_wait_s"] for m in all_metrics) / n_episodes
     avg_delay = sum(m["avg_delay_s"] for m in all_metrics) / n_episodes
+    avg_queue = sum(m["avg_queue_length"] for m in all_metrics) / n_episodes
     print(f"\n--- Evaluation summary ({n_episodes} episodes) ---")
-    print(f"  Avg return:  {avg_return:.2f}")
-    print(f"  Avg length:  {avg_length:.1f}")
+    print(f"  Avg return:      {avg_return:.2f}")
+    print(f"  Avg length:      {avg_length:.1f}")
     print(f"  Avg travel time: {avg_travel_time:.2f} s")
-    print(f"  Avg delay: {avg_delay:.2f} s")
+    print(f"  Avg wait:        {avg_wait:.2f} s")
+    print(f"  Avg time loss:   {avg_delay:.2f} s")
+    print(f"  Avg queue:       {avg_queue:.2f}")
 
     return all_metrics
 

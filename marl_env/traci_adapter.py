@@ -18,6 +18,12 @@ else:
     import traci  # type: ignore[import-untyped]
 
 
+# Stable TraCI/libsumo vehicle variable IDs used for per-vehicle episode stats.
+# Defined here so sumo_env can import them alongside TraCIAdapter.
+_VAR_ACCUM_WAITING: int = 0x87  # vehicle.getAccumulatedWaitingTime()
+_VAR_TIME_LOSS: int = 0xC9       # vehicle.getTimeLoss()
+
+
 class TraCIAdapter:
     """Manages SUMO process lifecycle and provides typed accessors.
 
@@ -178,6 +184,26 @@ class TraCIAdapter:
 
     def get_teleported_number(self) -> int:
         return self._require_conn().simulation.getStartingTeleportNumber()
+
+    # ------------------------------------------------------------------
+    # Vehicle subscriptions (per-vehicle episode stats)
+    # ------------------------------------------------------------------
+    def subscribe_vehicle(self, vid: str) -> None:
+        """Subscribe to accumulated waiting time and time loss for *vid*.
+
+        Must be called once after the vehicle departs.  Subscription data
+        is guaranteed to remain readable for one step after the vehicle
+        exits the network (both TraCI and libsumo preserve this).
+        """
+        self._require_conn().vehicle.subscribe(vid, [_VAR_ACCUM_WAITING, _VAR_TIME_LOSS])
+
+    def get_vehicle_subscription_results(self, vid: str) -> dict[int, Any]:
+        """Return the last subscription snapshot for *vid*.
+
+        Returns an empty dict if the vehicle was never subscribed or if
+        results are unavailable (safe fallback).
+        """
+        return dict(self._require_conn().vehicle.getSubscriptionResults(vid) or {})
 
     # ------------------------------------------------------------------
     # Internal helper

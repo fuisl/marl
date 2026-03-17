@@ -15,7 +15,7 @@ from torch import Tensor
 from marl_env.action_constraints import ActionConstraints
 from marl_env.graph_builder import GraphBuilder
 from marl_env.reward import IntersectionMetrics, RewardCalculator
-from marl_env.traci_adapter import TraCIAdapter
+from marl_env.traci_adapter import TraCIAdapter, _VAR_ACCUM_WAITING, _VAR_TIME_LOSS
 
 
 class TrafficSignalEnv:
@@ -118,6 +118,13 @@ class TrafficSignalEnv:
         self._depart_time_by_vehicle: dict[str, float] = {}
         self._episode_travel_time_sum_s: float = 0.0
         self._episode_arrived_vehicles: int = 0
+        # Per-vehicle benchmark accumulators (NeurIPS RESCO definitions)
+        self._episode_wait_time_sum_s: float = 0.0   # accumulated waiting per completed veh
+        self._episode_time_loss_sum_s: float = 0.0   # timeLoss per completed veh (= avg delay)
+        # Time-averaged queue: sum of halting vehicles across all sim steps
+        self._sim_step_queue_sum: float = 0.0
+        self._sim_step_count: int = 0
+        self._all_controlled_lanes: set[str] = set()
         self._node_incoming_lanes: dict[str, list[str]] = {}
         self._node_attached_rl_ids: dict[str, tuple[str, ...]] = {}
 
@@ -131,6 +138,10 @@ class TrafficSignalEnv:
         self._depart_time_by_vehicle = {}
         self._episode_travel_time_sum_s = 0.0
         self._episode_arrived_vehicles = 0
+        self._episode_wait_time_sum_s = 0.0
+        self._episode_time_loss_sum_s = 0.0
+        self._sim_step_queue_sum = 0.0
+        self._sim_step_count = 0
 
         # Discover agents
         self.tl_ids = self.adapter.get_traffic_light_ids()
@@ -193,6 +204,11 @@ class TrafficSignalEnv:
             len(self._green_phases[tl]) for tl in self.tl_ids
         )
 
+        # Cache the full set of controlled lanes once per episode for O(1) queue tracking.
+        self._all_controlled_lanes = {
+            lane for lanes in self._controlled_lanes.values() for lane in lanes
+        }
+
         return self._build_tensordict()
 
     def step(self, actions: Tensor) -> TensorDict:
@@ -228,14 +244,26 @@ class TrafficSignalEnv:
 
             now = float(self.adapter.current_time)
             for vid in self.adapter.get_departed_ids():
-                # Record first observed departure time.
+                # Record departure time and subscribe to per-vehicle stats.
                 self._depart_time_by_vehicle.setdefault(vid, now)
+                self.adapter.subscribe_vehicle(vid)
+
+            # Accumulate time-averaged queue: total halting vehicles this sim step.
+            self._sim_step_queue_sum += float(
+                sum(self.adapter.get_lane_halting_number(l) for l in self._all_controlled_lanes)
+            )
+            self._sim_step_count += 1
+
             for vid in self.adapter.get_arrived_ids():
                 t_depart = self._depart_time_by_vehicle.pop(vid, None)
                 if t_depart is None:
                     continue
                 self._episode_travel_time_sum_s += max(0.0, now - t_depart)
                 self._episode_arrived_vehicles += 1
+                # Subscription results stay readable for one step after arrival.
+                sub = self.adapter.get_vehicle_subscription_results(vid)
+                self._episode_wait_time_sum_s += float(sub.get(_VAR_ACCUM_WAITING, 0.0))
+                self._episode_time_loss_sum_s += float(sub.get(_VAR_TIME_LOSS, 0.0))
 
         self._last_interval_flow = {
             "arrived_vehicles": arrived_total,
@@ -301,13 +329,33 @@ class TrafficSignalEnv:
         }
 
     def get_episode_kpis(self) -> dict[str, float]:
-        """Return episode-level KPIs commonly reported in traffic RL papers."""
-        avg_travel_time = 0.0
-        if self._episode_arrived_vehicles > 0:
-            avg_travel_time = self._episode_travel_time_sum_s / self._episode_arrived_vehicles
+        """Return episode-level KPIs matching the NeurIPS RESCO benchmark definitions.
+
+        All per-vehicle metrics are averaged over completed vehicles only
+        (vehicles still in the network at episode end are excluded).
+        Queue is time-averaged over simulation steps.
+
+        Keys
+        ----
+        avg_travel_time_s : per-completed-vehicle (exit - enter)
+        avg_wait_s        : per-completed-vehicle accumulated waiting time
+                            (time with speed < 0.1 m/s)
+        avg_delay_s       : per-completed-vehicle timeLoss
+                            (= trip_time - free-flow_time)
+        avg_queue_length  : mean over sim steps of total halting vehicles
+        arrived_vehicles  : number of vehicles counted
+        """
+        n = self._episode_arrived_vehicles
+        avg_travel_time = self._episode_travel_time_sum_s / n if n > 0 else 0.0
+        avg_wait = self._episode_wait_time_sum_s / n if n > 0 else 0.0
+        avg_delay = self._episode_time_loss_sum_s / n if n > 0 else 0.0
+        avg_queue = self._sim_step_queue_sum / max(self._sim_step_count, 1)
         return {
             "avg_travel_time_s": float(avg_travel_time),
-            "arrived_vehicles": float(self._episode_arrived_vehicles),
+            "avg_wait_s": float(avg_wait),
+            "avg_delay_s": float(avg_delay),
+            "avg_queue_length": float(avg_queue),
+            "arrived_vehicles": float(n),
         }
 
     # ==================================================================

@@ -21,12 +21,15 @@ Outputs
 
 from __future__ import annotations
 
+import atexit
 import collections
 from collections.abc import Mapping
 import csv
 import json
 import os
 import random
+import signal
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -239,8 +242,6 @@ def run_episode(
     transitions: list[TensorDict] = []
     total_reward = 0.0
     avg_metric_keys = (
-        "avg_delay_s",
-        "avg_queue_length",
         "avg_speed_mps",
         "avg_occupancy_pct",
         "min_expected_vehicles",
@@ -288,8 +289,12 @@ def run_episode(
 
     episode_kpis = env.get_episode_kpis()
     validation_metrics = {
-        "avg_delay_s": metric_sums["avg_delay_s"] / max(n_decisions, 1),
-        "avg_queue_length": metric_sums["avg_queue_length"] / max(n_decisions, 1),
+        # Benchmark-accurate per-completed-vehicle metrics (NeurIPS RESCO definitions)
+        "avg_travel_time_s": float(episode_kpis.get("avg_travel_time_s", 0.0)),
+        "avg_wait_s":         float(episode_kpis.get("avg_wait_s", 0.0)),
+        "avg_delay_s":        float(episode_kpis.get("avg_delay_s", 0.0)),
+        "avg_queue_length":   float(episode_kpis.get("avg_queue_length", 0.0)),
+        # Interval-averaged monitoring stats (not benchmark metrics)
         "avg_speed_mps": metric_sums["avg_speed_mps"] / max(n_decisions, 1),
         "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(n_decisions, 1),
         "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(n_decisions, 1),
@@ -299,7 +304,6 @@ def run_episode(
         "total_arrived_vehicles": metric_sums["arrived_vehicles"],
         "total_departed_vehicles": metric_sums["departed_vehicles"],
         "total_teleported_vehicles": metric_sums["teleported_vehicles"],
-        "avg_travel_time_s": float(episode_kpis.get("avg_travel_time_s", 0.0)),
     }
     return transitions, total_reward, len(transitions), validation_metrics
 
@@ -616,13 +620,34 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             run_obj.summary["num_actions"] = num_actions
             run_obj.summary["graph_edges"] = n_edges
 
+        # Guarantee wandb.finish() is called even when the worker process is
+        # killed by the Hydra/loky launcher (SIGTERM/SIGKILL on Ctrl+C).
+        def _wandb_atexit() -> None:
+            if wandb.run is not None:
+                try:
+                    wandb.finish(exit_code=1)
+                except Exception:
+                    pass
+
+        atexit.register(_wandb_atexit)
+
+        # SIGTERM (sent by loky on cleanup) does NOT trigger Python exception
+        # handling by default. Convert it to KeyboardInterrupt so:
+        #   - if it arrives during training, the normal interrupt→postprocess path runs
+        #   - if it arrives during postprocessing, SIG_IGN (set below) blocks it
+        def _sigterm_to_interrupt(signum: int, frame: object) -> None:  # noqa: ANN001
+            raise KeyboardInterrupt()
+
+        signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
+
     # --- Logging ---
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.csv"
     fieldnames = [
         "episode", "n_steps", "return", "return_ma50",
         "return_per_agent_step",
-        "traffic_avg_travel_time_s", "traffic_avg_delay_s", "traffic_avg_queue_length",
+        "traffic_avg_travel_time_s", "traffic_avg_wait_s",
+        "traffic_avg_delay_s", "traffic_avg_queue_length",
         "val_avg_speed_mps", "val_avg_occupancy_pct",
         "val_avg_min_expected_vehicles",
         "traffic_network_total_waiting_s", "traffic_network_total_vehicles",
@@ -684,8 +709,9 @@ def train(cfg: DictConfig) -> dict[str, Any]:
                 "return_ma50":       round(ma50, 3),
                 "return_per_agent_step": round(return_per_agent_step, 6),
                 "traffic_avg_travel_time_s": round(validation_metrics["avg_travel_time_s"], 4),
-                "traffic_avg_delay_s": round(validation_metrics["avg_delay_s"], 4),
-                "traffic_avg_queue_length": round(validation_metrics["avg_queue_length"], 4),
+                "traffic_avg_wait_s":         round(validation_metrics["avg_wait_s"], 4),
+                "traffic_avg_delay_s":        round(validation_metrics["avg_delay_s"], 4),
+                "traffic_avg_queue_length":   round(validation_metrics["avg_queue_length"], 4),
                 "val_avg_speed_mps": round(validation_metrics["avg_speed_mps"], 4),
                 "val_avg_occupancy_pct": round(validation_metrics["avg_occupancy_pct"], 4),
                 "val_avg_min_expected_vehicles": round(validation_metrics["avg_min_expected_vehicles"], 4),
@@ -725,8 +751,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
 
                     # Traffic metrics (truthful names to match implemented formulas)
                     "Traffic/Average Travel Time (s)": validation_metrics["avg_travel_time_s"],
-                    "Traffic/Average Waiting Time (s)": validation_metrics["avg_delay_s"],
-                    "Traffic/Average Delay Proxy (s)": validation_metrics["avg_delay_s"],
+                    "Traffic/Average Waiting Time (s)": validation_metrics["avg_wait_s"],
+                    "Traffic/Average Time Loss (s)": validation_metrics["avg_delay_s"],
                     "Traffic/Average Queue Length": validation_metrics["avg_queue_length"],
                     "Traffic/Average Speed (m/s)": validation_metrics["avg_speed_mps"],
                     "Traffic/Average Occupancy (%)": validation_metrics["avg_occupancy_pct"],
@@ -739,8 +765,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
 
                     # RESCO-compatible aliases for easier cross-plotting
                     "RESCO/duration": validation_metrics["avg_travel_time_s"],
-                    "RESCO/waitingTime": validation_metrics["avg_delay_s"],
-                    "RESCO/timeLoss_proxy": validation_metrics["avg_delay_s"],
+                    "RESCO/waitingTime": validation_metrics["avg_wait_s"],
+                    "RESCO/timeLoss": validation_metrics["avg_delay_s"],
                     "RESCO/queue_lengths": validation_metrics["avg_queue_length"],
                     "RESCO/rewards": ep_return,
                     "RESCO/vehicles": validation_metrics["total_departed_vehicles"],
@@ -761,6 +787,12 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             episodes_completed = ep
     except KeyboardInterrupt:
         interrupted = True
+        # Block further SIGTERM signals from loky so the postprocess/visualization
+        # phase can run to completion without being forcibly killed.
+        try:
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        except (OSError, ValueError):
+            pass
         print("\nTraining interrupted. Finalizing and running post-processing...")
         if not best_ckpt_path.exists():
             torch.save(agent.state_dict(), best_ckpt_path)
@@ -794,7 +826,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             run_obj.summary["interrupted"] = bool(interrupted)
             run_obj.summary["episodes_completed"] = int(episodes_completed)
             run_obj.summary["best_return"] = float(best_return)
-        wandb.finish()
+            exit_code = 1 if interrupted else 0
+            wandb.finish(exit_code=exit_code)
 
     print("-" * 85)
     print(f"\nDone.  Best return: {best_return:.2f}")
