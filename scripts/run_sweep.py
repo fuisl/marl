@@ -11,9 +11,12 @@ sets HYDRA_N_JOBS, and launches:
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 from typing import Sequence
+
+from process_cleanup import terminate_descendants
 
 
 def _visible_gpu_count() -> int:
@@ -71,8 +74,19 @@ def main() -> int:
     print(f"[run_sweep] visible_gpus={gpu_count} -> hydra.launcher.n_jobs={n_jobs}")
     print("[run_sweep] command:", " ".join(cmd))
 
-    completed = subprocess.run(cmd, env=env)
-    return int(completed.returncode)
+    proc = subprocess.Popen(cmd, env=env)
+    try:
+        return int(proc.wait())
+    except KeyboardInterrupt:
+        terminate_descendants(proc.pid)
+        try:
+            proc.send_signal(signal.SIGINT)
+            return int(proc.wait(timeout=3.0))
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            return 130
+        except ProcessLookupError:
+            return 130
 
 
 if __name__ == "__main__":

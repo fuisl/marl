@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
-import os
 import shutil
 import sys
 import types
@@ -47,9 +46,6 @@ def pytest_configure(config: pytest.Config) -> None:
 @pytest.fixture(scope="session")
 def sumo_stack() -> dict[str, object]:
     """Provide SUMO Python tooling for integration tests or skip them."""
-    using_libsumo = "LIBSUMO_AS_TRACI" in os.environ
-    traci_ready = _REAL_LIBSUMO_AVAILABLE if using_libsumo else _REAL_TRACI_AVAILABLE
-
     missing: list[str] = []
     if shutil.which("sumo") is None:
         missing.append("sumo binary")
@@ -57,12 +53,8 @@ def sumo_stack() -> dict[str, object]:
         missing.append("netconvert binary")
     if not _REAL_SUMOLIB_AVAILABLE:
         missing.append("sumolib Python package")
-    if not traci_ready:
-        missing.append(
-            "libsumo Python package"
-            if using_libsumo
-            else "traci Python package"
-        )
+    if not _REAL_LIBSUMO_AVAILABLE:
+        missing.append("libsumo Python package")
 
     if missing:
         pytest.skip("SUMO integration tests skipped; missing: " + ", ".join(missing))

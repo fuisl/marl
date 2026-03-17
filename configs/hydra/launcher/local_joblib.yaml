@@ -1,0 +1,13 @@
+# Local Hydra launcher override composed explicitly from the Joblib plugin schema.
+# This avoids deprecated automatic schema matching for hydra/launcher=joblib.
+# Applies only to `-m` multirun sweeps.
+# @package hydra.launcher
+
+defaults:
+  - joblib
+  - _self_
+
+n_jobs: ${oc.decode:${oc.env:HYDRA_N_JOBS,3}}
+backend: loky
+prefer: processes
+verbose: 0

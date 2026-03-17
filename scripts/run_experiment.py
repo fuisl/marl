@@ -13,7 +13,9 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+import signal
 import sys
 from typing import Any
 
@@ -24,10 +26,27 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from config_utils import load_dotenv
+from process_cleanup import terminate_descendants
 from train.fixed_time_baseline import run_baseline
 from train.discrete_sac_loop import train as run_training_loop
 
 load_dotenv()
+
+
+_INTERRUPTED = False
+
+
+def _cleanup_workers() -> None:
+    terminate_descendants(os.getpid())
+
+
+def _handle_signal(signum: int, _frame: Any) -> None:
+    global _INTERRUPTED
+    if _INTERRUPTED:
+        raise SystemExit(130)
+    _INTERRUPTED = True
+    _cleanup_workers()
+    raise KeyboardInterrupt(f"Received signal {signum}")
 
 
 def _as_plain(cfg: Any) -> Any:
@@ -56,7 +75,7 @@ def _validate_cfg(cfg: DictConfig) -> None:
         )
 
 
-def _run_training(cfg: DictConfig, env_cfg: dict[str, Any]) -> None:
+def _run_training(cfg: DictConfig, env_cfg: dict[str, Any]) -> dict[str, Any]:
     run_cfg = {
         "env": env_cfg,
         "model": _as_plain(cfg.model),
@@ -68,7 +87,10 @@ def _run_training(cfg: DictConfig, env_cfg: dict[str, Any]) -> None:
     }
     run_cfg["train"]["seed"] = int(cfg.seed)
     run_cfg["wandb"]["run_name"] = str(run_cfg["wandb"].get("run_name") or cfg.run_name)
-    run_training_loop(OmegaConf.create(run_cfg))
+    result = run_training_loop(OmegaConf.create(run_cfg))
+    if isinstance(result, dict):
+        return result
+    return {"interrupted": False}
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="run")
@@ -78,14 +100,38 @@ def main(cfg: DictConfig) -> None:
 
     trainer = str(cfg.algo.trainer)
     if trainer == "discrete_sac":
-        _run_training(cfg, env_cfg)
+        try:
+            _run_training(cfg, env_cfg)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            # Exceptions escaping the training loop may carry traceback frames
+            # that hold libsumo SWIG objects, which are not picklable by loky.
+            # Re-raise as a plain RuntimeError with a clean traceback so loky
+            # can serialize the failure and report it to the parent process.
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from None
         return
     if trainer == "fixed_time_baseline":
-        run_baseline(env_cfg)
+        run_baseline(
+            env_cfg,
+            out_dir=str(cfg.runtime.out_dir),
+            wandb_cfg=_as_plain(cfg.logger.wandb),
+            run_name=str(cfg.run_name),
+            seed=int(cfg.seed),
+        )
         return
 
     raise ValueError(f"Unknown algo.trainer '{trainer}'.")
 
 
 if __name__ == "__main__":
-    main()
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+    try:
+        main()
+    except KeyboardInterrupt:
+        _cleanup_workers()
+        raise SystemExit(130)
+    finally:
+        if _INTERRUPTED:
+            _cleanup_workers()

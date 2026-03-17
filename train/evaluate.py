@@ -7,8 +7,6 @@ Usage::
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import hydra
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -16,7 +14,6 @@ from omegaconf import DictConfig, OmegaConf
 from config_utils import load_dotenv, resolve_repo_path
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
-from rl.rollout import RolloutWorker
 
 load_dotenv()
 
@@ -54,22 +51,91 @@ def evaluate(
     agent.load_state_dict(state_dict)
     agent.eval()
 
-    worker = RolloutWorker(env=env, agent=agent, device=device)
+    avg_metric_keys = (
+        "avg_speed_mps",
+        "avg_occupancy_pct",
+        "min_expected_vehicles",
+        "network_total_waiting_s",
+        "network_total_vehicles",
+    )
+    total_metric_keys = (
+        "arrived_vehicles",
+        "departed_vehicles",
+        "teleported_vehicles",
+    )
 
     all_metrics: list[dict[str, float]] = []
     for ep in range(n_episodes):
-        _, info = worker.collect_episode(deterministic=True)
-        print(f"Episode {ep + 1}/{n_episodes}: {info}")
-        all_metrics.append(info)
+        td = env.reset().to(device)
+        total_reward = 0.0
+        steps = 0
+        metric_sums: dict[str, float] = {k: 0.0 for k in avg_metric_keys + total_metric_keys}
+
+        while True:
+            obs = td.get("graph_observation", td["agents", "observation"])
+            edge_index = td["edge_index"]
+            edge_attr = td.get("edge_attr", None)
+            action_mask = td["agents", "action_mask"]
+
+            actions, _ = agent.select_action(
+                obs,
+                edge_index,
+                edge_attr,
+                action_mask,
+                deterministic=True,
+                agent_node_indices=td["agent_node_indices"],
+                agent_node_mask=td["agent_node_mask"],
+            )
+
+            next_td = env.step(actions.cpu()).to(device)
+            total_reward += float(next_td["agents", "reward"].sum().item())
+            interval = env.get_interval_kpis()
+            for key in avg_metric_keys + total_metric_keys:
+                metric_sums[key] += float(interval.get(key, 0.0))
+            steps += 1
+
+            if next_td["done"].item():
+                break
+            td = next_td
+
+        episode_kpis = env.get_episode_kpis()
+        enriched_info = {
+            "episode_return": total_reward,
+            "episode_length": float(steps),
+            # Benchmark-accurate per-completed-vehicle metrics (NeurIPS RESCO)
+            "avg_travel_time_s": float(episode_kpis.get("avg_travel_time_s", 0.0)),
+            "avg_wait_s":         float(episode_kpis.get("avg_wait_s", 0.0)),
+            "avg_delay_s":        float(episode_kpis.get("avg_delay_s", 0.0)),
+            "avg_queue_length":   float(episode_kpis.get("avg_queue_length", 0.0)),
+            # Interval-averaged monitoring stats
+            "avg_speed_mps": metric_sums["avg_speed_mps"] / max(steps, 1),
+            "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(steps, 1),
+            "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(steps, 1),
+            "avg_network_waiting_s_per_decision": metric_sums["network_total_waiting_s"] / max(steps, 1),
+            "avg_network_vehicles_per_decision": metric_sums["network_total_vehicles"] / max(steps, 1),
+            "total_arrived_vehicles": metric_sums["arrived_vehicles"],
+            "total_departed_vehicles": metric_sums["departed_vehicles"],
+            "total_teleported_vehicles": metric_sums["teleported_vehicles"],
+        }
+        print(f"Episode {ep + 1}/{n_episodes}: {enriched_info}")
+        all_metrics.append(enriched_info)
 
     env.close()
 
     # Summary
     avg_return = sum(m["episode_return"] for m in all_metrics) / n_episodes
     avg_length = sum(m["episode_length"] for m in all_metrics) / n_episodes
+    avg_travel_time = sum(m["avg_travel_time_s"] for m in all_metrics) / n_episodes
+    avg_wait = sum(m["avg_wait_s"] for m in all_metrics) / n_episodes
+    avg_delay = sum(m["avg_delay_s"] for m in all_metrics) / n_episodes
+    avg_queue = sum(m["avg_queue_length"] for m in all_metrics) / n_episodes
     print(f"\n--- Evaluation summary ({n_episodes} episodes) ---")
-    print(f"  Avg return:  {avg_return:.2f}")
-    print(f"  Avg length:  {avg_length:.1f}")
+    print(f"  Avg return:      {avg_return:.2f}")
+    print(f"  Avg length:      {avg_length:.1f}")
+    print(f"  Avg travel time: {avg_travel_time:.2f} s")
+    print(f"  Avg wait:        {avg_wait:.2f} s")
+    print(f"  Avg time loss:   {avg_delay:.2f} s")
+    print(f"  Avg queue:       {avg_queue:.2f}")
 
     return all_metrics
 

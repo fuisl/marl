@@ -107,10 +107,10 @@ This avoids duplicating giant monolithic configs and makes sweeps natural.
 
 ## How to run
 
-`configs/run.yaml` sets multirun launcher to `hydra/launcher=joblib` by default,
+`configs/run.yaml` sets multirun launcher to `hydra/launcher=local_joblib` by default,
 so `-m` sweeps run in parallel.
 
-Default parallel workers are in `configs/hydra/launcher/joblib.yaml`.
+Default parallel workers are in `configs/hydra/launcher/local_joblib.yaml`.
 `n_jobs` is read from `HYDRA_N_JOBS` (default `3`).
 
 Override options:

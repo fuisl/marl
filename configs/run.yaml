@@ -7,12 +7,23 @@ defaults:
   - logger: default
   - runtime: default
   - optional experiment: null
-  - override hydra/launcher: joblib
+  - override hydra/launcher: local_joblib
   - _self_
 
 project: marl-traffic-gat
 seed: 21
 run_name: ${algo.name}_${scenario.name}_seed${seed}
+
+# Run-level safety defaults: keep all optimizers on Adam.
+train:
+  optimizer:
+    name: adam
+  optimizer_actor:
+    name: adam
+  optimizer_critic:
+    name: adam
+  optimizer_alpha:
+    name: adam
 
 tags: []
 

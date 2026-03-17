@@ -27,9 +27,17 @@ class _FakeSimulationAPI:
         self.calls.append(("getDepartedNumber", ()))
         return 3
 
+    def getDepartedIDList(self) -> list[str]:
+        self.calls.append(("getDepartedIDList", ()))
+        return ["veh_dep_1"]
+
     def getArrivedNumber(self) -> int:
         self.calls.append(("getArrivedNumber", ()))
         return 2
+
+    def getArrivedIDList(self) -> list[str]:
+        self.calls.append(("getArrivedIDList", ()))
+        return ["veh_arr_1"]
 
     def getStartingTeleportNumber(self) -> int:
         self.calls.append(("getStartingTeleportNumber", ()))
@@ -104,11 +112,37 @@ class _FakeLaneAPI:
         return 13.89
 
 
+class _FakeTraCIException(Exception):
+    pass
+
+
+class _FakeVehicleAPI:
+    def __init__(self) -> None:
+        self.subscribe_calls: list[tuple[str, list[int]]] = []
+        self.subscription_results: dict[str, dict[int, float]] = {}
+        self.raise_on_timeloss_subscribe = False
+        self.get_timeloss_calls: list[str] = []
+
+    def subscribe(self, veh_id: str, variables: list[int]) -> None:
+        if self.raise_on_timeloss_subscribe and 0x8C in variables:
+            raise _FakeTraCIException("unsupported variable")
+        self.subscribe_calls.append((veh_id, variables))
+
+    def getSubscriptionResults(self, veh_id: str) -> dict[int, float]:
+        return self.subscription_results.get(veh_id, {})
+
+    def getTimeLoss(self, veh_id: str) -> float:
+        self.get_timeloss_calls.append(veh_id)
+        return 4.0
+
+
 class _FakeConnection:
     def __init__(self) -> None:
         self.simulation = _FakeSimulationAPI()
         self.trafficlight = _FakeTrafficLightAPI()
         self.lane = _FakeLaneAPI()
+        self.vehicle = _FakeVehicleAPI()
+        self.TraCIException = _FakeTraCIException
         self.simulation_step_calls = 0
         self.close_calls: list[bool] = []
 
@@ -119,24 +153,12 @@ class _FakeConnection:
         self.close_calls.append(wait)
 
 
-class _FakeTraciModule:
-    def __init__(self, conn: _FakeConnection) -> None:
-        self.conn = conn
-        self.start_calls: list[tuple[list[str], str | None]] = []
-        self.get_connection_calls: list[str] = []
-
-    def start(self, cmd: list[str], label: str | None = None) -> None:
-        self.start_calls.append((cmd, label))
-
-    def getConnection(self, label: str) -> _FakeConnection:
-        self.get_connection_calls.append(label)
-        return self.conn
-
-
 class _FakeLibsumoModule:
     def __init__(self) -> None:
         self.start_calls: list[list[str]] = []
         self.close_calls: list[bool] = []
+        self.TraCIException = _FakeTraCIException
+        self.vehicle = _FakeVehicleAPI()
 
     def start(self, cmd: list[str]) -> None:
         self.start_calls.append(cmd)
@@ -144,29 +166,8 @@ class _FakeLibsumoModule:
     def close(self, wait: bool = False) -> None:
         self.close_calls.append(wait)
 
-
-def test_start_and_close_plain_traci(monkeypatch: pytest.MonkeyPatch) -> None:
-    fake_conn = _FakeConnection()
-    fake_traci = _FakeTraciModule(fake_conn)
-    monkeypatch.setattr(traci_adapter_mod, "traci", fake_traci)
-
-    adapter = TraCIAdapter("net.net.xml", "route.rou.xml", label="test-label")
-    adapter._using_libsumo = False
-
-    adapter.start()
-    assert fake_traci.start_calls == [(adapter._sumo_cmd, "test-label")]
-    assert fake_traci.get_connection_calls == ["test-label"]
-    assert adapter._conn is fake_conn
-
-    with pytest.raises(RuntimeError, match="already open"):
-        adapter.start()
-
-    adapter.close(wait=True)
-    assert fake_conn.close_calls == [True]
-    assert adapter._conn is None
-
-    # Closing twice should be a no-op.
-    adapter.close(wait=False)
+    def getVersion(self) -> tuple[int, str]:
+        return (22, "SUMO 1.26.0")
 
 
 def test_start_and_close_libsumo(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -174,7 +175,6 @@ def test_start_and_close_libsumo(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(traci_adapter_mod, "traci", fake_libsumo)
 
     adapter = TraCIAdapter("net.net.xml", "route.rou.xml")
-    adapter._using_libsumo = True
     adapter.start()
 
     assert fake_libsumo.start_calls == [adapter._sumo_cmd]
@@ -183,6 +183,64 @@ def test_start_and_close_libsumo(monkeypatch: pytest.MonkeyPatch) -> None:
     adapter.close(wait=False)
     assert fake_libsumo.close_calls == [False]
     assert adapter._conn is None
+
+
+def test_subscribe_vehicle_falls_back_when_timeloss_unsupported() -> None:
+    adapter = TraCIAdapter(
+        "net.net.xml",
+        "route.rou.xml",
+        timeloss_subscription_policy="fallback",
+    )
+    conn = _FakeConnection()
+    conn.vehicle.raise_on_timeloss_subscribe = True
+    adapter._conn = conn
+
+    adapter.subscribe_vehicle("veh-1")
+    adapter.subscribe_vehicle("veh-2")
+
+    assert conn.vehicle.subscribe_calls == [
+        ("veh-1", [0x87]),
+        ("veh-2", [0x87]),
+    ]
+
+
+def test_vehicle_metrics_use_subscription_or_direct_fallback() -> None:
+    adapter = TraCIAdapter(
+        "net.net.xml",
+        "route.rou.xml",
+        timeloss_subscription_policy="fallback",
+    )
+    conn = _FakeConnection()
+    adapter._conn = conn
+
+    conn.vehicle.subscription_results["veh-sub"] = {0x87: 2.0, 0x8C: 3.0}
+    assert adapter.get_vehicle_benchmark_metrics("veh-sub") == (2.0, 3.0)
+
+    conn.vehicle.subscription_results["veh-direct"] = {0x87: 1.5}
+    assert adapter.get_vehicle_benchmark_metrics("veh-direct") == (1.5, 4.0)
+
+    adapter._vehicle_timeloss_sub_supported = False
+    conn.vehicle.subscription_results["veh-compat"] = {0x87: 6.0}
+    assert adapter.get_vehicle_benchmark_metrics("veh-compat") == (6.0, 6.0)
+
+
+def test_subscribe_vehicle_strict_policy_raises() -> None:
+    adapter = TraCIAdapter(
+        "net.net.xml",
+        "route.rou.xml",
+        timeloss_subscription_policy="strict",
+    )
+    conn = _FakeConnection()
+    conn.vehicle.raise_on_timeloss_subscribe = True
+    adapter._conn = conn
+
+    with pytest.raises(_FakeTraCIException):
+        adapter.subscribe_vehicle("veh-1")
+
+
+def test_invalid_timeloss_policy_raises() -> None:
+    with pytest.raises(ValueError, match="timeloss_subscription_policy"):
+        TraCIAdapter("net.net.xml", "route.rou.xml", timeloss_subscription_policy="invalid")
 
 
 def test_all_interface_methods_forward_to_connection() -> None:
@@ -214,7 +272,9 @@ def test_all_interface_methods_forward_to_connection() -> None:
     assert adapter.get_lane_max_speed("lane_a") == 13.89
 
     assert adapter.get_departed_number() == 3
+    assert adapter.get_departed_ids() == ["veh_dep_1"]
     assert adapter.get_arrived_number() == 2
+    assert adapter.get_arrived_ids() == ["veh_arr_1"]
     assert adapter.get_teleported_number() == 1
 
     adapter.close(wait=False)

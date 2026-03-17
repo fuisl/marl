@@ -41,3 +41,27 @@ optimizer_alpha:
   eps: 1.0e-8
   weight_decay: 0.0
   amsgrad: false
+
+critic_stability:
+  use_huber_loss: false
+  huber_delta: 1.0
+  clip_target_q: false
+  target_q_min: -100.0
+  target_q_max: 100.0
+
+postprocess:
+  enabled: true
+  on_complete: true
+  on_interrupt: true
+
+  run_evaluation: true
+  eval_episodes: 5
+  eval_gui: false
+
+  run_visualization: true
+  visualization_out_dir: null
+  visualization_device: cpu
+  visualization_num_snapshots: 5
+  visualization_max_hops: null
+  visualization_curve_num_samples: null
+  visualization_map_num_samples: null

@@ -141,6 +141,42 @@ class FakeTraCIAdapter:
     def get_lane_mean_speed(lane_id: str) -> float:
         return 5.0 if lane_id.endswith("1") else 6.0
 
+    @staticmethod
+    def get_vehicle_benchmark_metrics(vid: str) -> tuple[float, float]:
+        _ = vid
+        return (0.0, 0.0)
+
+
+class FakeTraCIAdapterVehicleMetrics(FakeTraCIAdapter):
+    def __init__(self, done_after: int = 3) -> None:
+        super().__init__(done_after=done_after)
+        self._active_vehicle_id = "veh0"
+
+    def simulation_step(self) -> None:
+        self.time += 1
+
+    def get_departed_ids(self) -> list[str]:
+        return [self._active_vehicle_id] if self.time == 1 else []
+
+    def get_arrived_ids(self) -> list[str]:
+        return [self._active_vehicle_id] if self.time == 2 else []
+
+    def get_arrived_number(self) -> int:
+        return 1 if self.time == 2 else 0
+
+    def get_departed_number(self) -> int:
+        return 1 if self.time == 1 else 0
+
+    @staticmethod
+    def subscribe_vehicle(vid: str) -> None:
+        _ = vid
+
+    def get_vehicle_benchmark_metrics(self, vid: str) -> tuple[float, float]:
+        if self.time < 2 and vid == self._active_vehicle_id:
+            return (12.0, 34.0)
+        # Mimic libsumo behavior where vehicle metrics are unavailable at arrival.
+        return (0.0, 0.0)
+
 
 class FakeGraphBuilder:
     def __init__(
@@ -268,3 +304,29 @@ def test_transition_sequence_and_elapsed_reset(monkeypatch: object) -> None:
     # destination green and may increase on subsequent steps.
     assert 0.0 in elapsed_trace
     assert not env.constraints.in_transition("J1")
+
+
+def test_episode_kpis_use_cached_vehicle_metrics_when_arrival_lookup_empty(monkeypatch: object) -> None:
+    import marl_env.sumo_env as sumo_env_mod
+
+    monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
+    env = TrafficSignalEnv(
+        net_file="dummy.net.xml",
+        route_file="dummy.rou.xml",
+        delta_t=1,
+        min_green_duration=0,
+    )
+    env.adapter = FakeTraCIAdapterVehicleMetrics(done_after=3)
+    env.graph_builder = None
+
+    td = env.reset()
+    for _ in range(3):
+        actions = _sample_valid_actions(td["agents", "action_mask"])
+        td = env.step(actions)
+        if bool(td["done"].item()):
+            break
+
+    kpis = env.get_episode_kpis()
+    assert kpis["arrived_vehicles"] >= 1.0
+    assert kpis["avg_wait_s"] > 0.0
+    assert kpis["avg_delay_s"] > 0.0
