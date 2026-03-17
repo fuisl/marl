@@ -101,6 +101,19 @@ python -m train.evaluate runtime.checkpoint_path=runs/<run>/best_agent.pt
 
 # Visualize graph influence artifacts
 python scripts/visualize_graph_influence.py runtime.checkpoint_path=runs/<run>/best_agent.pt
+
+# Hide blue graph edges in the influence map for a cleaner heat view
+python scripts/visualize_graph_influence.py \
+  runtime.checkpoint_path=runs/<run>/best_agent.pt \
+  analysis.show_blue_edges_influence_map=false
+
+# Pick focal source node and control smoothing/contours
+python scripts/visualize_graph_influence.py \
+  runtime.checkpoint_path=runs/<run>/best_agent.pt \
+  analysis.focal_node_index=10 \
+  analysis.show_heat_contours=true \
+  analysis.num_heat_contours=6 \
+  analysis.heat_sigma_scale=0.06
 ```
 
 ## Environment Setup

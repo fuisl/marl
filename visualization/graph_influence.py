@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib
+import numpy as np
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -515,6 +516,7 @@ def plot_graph_topology(
     positions: Tensor,
     edge_index: Tensor,
     node_labels: list[str],
+    node_is_signal: list[bool] | None = None,
     *,
     method_name: str,
     road_segments: list[RoadSegment] | None = None,
@@ -538,16 +540,38 @@ def plot_graph_topology(
     _plot_edges(ax, positions, edges, color="#0069C0", linewidth=2.2, alpha=0.98)
 
     valid = torch.isfinite(positions).all(dim=1)
-    node_size = 70 if len(node_labels) <= 100 else 12
+    if node_is_signal is None or len(node_is_signal) != len(node_labels):
+        node_is_signal = [False] * len(node_labels)
+
+    signal_mask = torch.tensor(node_is_signal, dtype=torch.bool) & valid
+    non_signal_mask = (~torch.tensor(node_is_signal, dtype=torch.bool)) & valid
+
+    regular_size = 68 if len(node_labels) <= 100 else 14
+    signal_size = 94 if len(node_labels) <= 100 else 24
+
     ax.scatter(
-        positions[valid, 0].tolist(),
-        positions[valid, 1].tolist(),
-        s=node_size,
+        positions[non_signal_mask, 0].tolist(),
+        positions[non_signal_mask, 1].tolist(),
+        s=regular_size,
         c="#0057A8",
         edgecolors="white",
         linewidths=0.6,
         zorder=3,
+        label="Intersection node",
     )
+    if bool(signal_mask.any()):
+        ax.scatter(
+            positions[signal_mask, 0].tolist(),
+            positions[signal_mask, 1].tolist(),
+            s=signal_size,
+            c="#E86A33",
+            marker="D",
+            edgecolors="white",
+            linewidths=0.7,
+            zorder=4,
+            label="Traffic control signal",
+        )
+        ax.legend(loc="upper right", fontsize=8, frameon=True)
 
     if len(node_labels) <= 100:
         for idx, node_label in enumerate(node_labels):
@@ -611,77 +635,196 @@ def plot_node_influence_map(
     node_rows: list[dict[str, Any]],
     *,
     method_name: str,
+    source_node_index: int,
+    source_node_label: str,
+    hop_influence_curve: Tensor,
+    show_blue_edges: bool = True,
+    show_heat_contours: bool = True,
+    num_heat_contours: int = 6,
+    heat_grid_size: int = 220,
+    heat_sigma_scale: float = 0.06,
+    heat_percentile_low: float = 2.0,
+    heat_percentile_high: float = 98.0,
     road_segments: list[RoadSegment] | None = None,
 ) -> None:
+    def _robust_log_normalize(values: np.ndarray) -> np.ndarray:
+        safe = np.maximum(values.astype(np.float64), 0.0)
+        logged = np.log1p(safe)
+        lo = float(np.percentile(logged, heat_percentile_low))
+        hi = float(np.percentile(logged, heat_percentile_high))
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+            lo = float(logged.min())
+            hi = float(logged.max())
+        if hi <= lo:
+            return np.zeros_like(logged)
+        clipped = np.clip(logged, lo, hi)
+        return (clipped - lo) / (hi - lo)
+
+    def _compute_smoothed_field(
+        xs: np.ndarray,
+        ys: np.ndarray,
+        weights: np.ndarray,
+        bounds: tuple[float, float, float, float],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x_min, x_max, y_min, y_max = bounds
+        grid_n = max(80, int(heat_grid_size))
+        gx = np.linspace(x_min, x_max, grid_n)
+        gy = np.linspace(y_min, y_max, grid_n)
+        grid_x, grid_y = np.meshgrid(gx, gy)
+
+        diag = max(np.hypot(x_max - x_min, y_max - y_min), 1.0)
+        sigma = max(diag * float(heat_sigma_scale), 1e-3)
+        sigma2 = sigma * sigma
+
+        field = np.zeros_like(grid_x, dtype=np.float64)
+        weight_sum = float(np.maximum(weights.sum(), 1e-12))
+        for px, py, weight in zip(xs, ys, weights, strict=True):
+            if weight <= 0.0:
+                continue
+            dist2 = (grid_x - px) ** 2 + (grid_y - py) ** 2
+            field += float(weight) * np.exp(-0.5 * dist2 / sigma2)
+
+        return grid_x, grid_y, field / weight_sum
+
+    def _draw_base_graph(ax: plt.Axes, edges: list[tuple[int, int]]) -> None:
+        _plot_road_segments_with_style(
+            ax,
+            road_segments or [],
+            color="#D2D7DE",
+            alpha=0.55,
+            base_linewidth=0.28,
+            linewidth_scale=0.85,
+            zorder=0,
+        )
+        if show_blue_edges:
+            _plot_edges(ax, positions, edges, color="#5D8DBA", linewidth=0.7, alpha=0.35)
+
     edges = deduplicate_undirected_edges(edge_index)
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_facecolor("#F5F6F7")
-
-    _plot_road_segments_with_style(
-        ax,
-        road_segments or [],
-        color="#C6CCD3",
-        alpha=0.95,
-        base_linewidth=0.45,
-        linewidth_scale=1.2,
-        zorder=0,
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(21, 7.2),
+        gridspec_kw={"width_ratios": [1.0, 1.0, 0.9]},
     )
-    _plot_edges(ax, positions, edges, color="#FDFDFD", linewidth=3.4, alpha=0.92)
-    _plot_edges(ax, positions, edges, color="#0069C0", linewidth=1.7, alpha=0.72)
 
-    sampled_rows = [row for row in node_rows if row["is_sampled"]]
-    unsampled_rows = [row for row in node_rows if not row["is_sampled"]]
+    valid_rows = [row for row in node_rows if row["has_position"]]
+    if not valid_rows:
+        raise RuntimeError("No finite node positions available for influence map.")
 
-    if unsampled_rows:
-        xs = [row["x"] for row in unsampled_rows if row["has_position"]]
-        ys = [row["y"] for row in unsampled_rows if row["has_position"]]
-        if xs:
-            ax.scatter(
-                xs,
-                ys,
-                s=12,
-                c="#C7CED6",
-                edgecolors="white",
-                linewidths=0.25,
-                alpha=0.95,
+    xs = np.asarray([row["x"] for row in valid_rows], dtype=np.float64)
+    ys = np.asarray([row["y"] for row in valid_rows], dtype=np.float64)
+    raw_vals = np.asarray([row["influence_normalized"] for row in valid_rows], dtype=np.float64)
+    color_vals = _robust_log_normalize(raw_vals)
+
+    focal_x = float(positions[source_node_index, 0].item())
+    focal_y = float(positions[source_node_index, 1].item())
+    bounds = _compute_plot_bounds(positions, road_segments)
+    if bounds is None:
+        raise RuntimeError("Unable to determine plot bounds for influence map.")
+
+    raw_ax = axes[0]
+    raw_ax.set_facecolor("#FAFBFC")
+    _draw_base_graph(raw_ax, edges)
+    raw_ax.scatter(xs, ys, s=7, c="#BBC4CE", edgecolors="none", alpha=0.6, zorder=1)
+    raw_scatter = raw_ax.scatter(
+        xs,
+        ys,
+        s=15,
+        c=color_vals,
+        cmap="magma",
+        edgecolors="none",
+        alpha=0.95,
+        zorder=2,
+    )
+    raw_ax.scatter(
+        [focal_x],
+        [focal_y],
+        s=170,
+        c="#103B73",
+        marker="*",
+        edgecolors="white",
+        linewidths=0.8,
+        zorder=4,
+    )
+    raw_ax.set_title("Raw Node Influence $I(v,u)$")
+    _style_map_axes(raw_ax, positions, road_segments)
+    raw_cbar = fig.colorbar(raw_scatter, ax=raw_ax, fraction=0.046, pad=0.02)
+    raw_cbar.set_label("Robust log-normalized influence")
+
+    heat_ax = axes[1]
+    heat_ax.set_facecolor("#FAFBFC")
+    _draw_base_graph(heat_ax, edges)
+    grid_x, grid_y, field = _compute_smoothed_field(xs, ys, color_vals, bounds)
+    im = heat_ax.imshow(
+        field,
+        origin="lower",
+        extent=(bounds[0], bounds[1], bounds[2], bounds[3]),
+        cmap="magma",
+        alpha=0.8,
+        zorder=1,
+        aspect="auto",
+    )
+    if show_heat_contours and num_heat_contours > 0 and float(field.max()) > 0.0:
+        levels = np.linspace(float(field.min()), float(field.max()), int(num_heat_contours) + 2)[1:-1]
+        if levels.size > 0:
+            heat_ax.contour(
+                grid_x,
+                grid_y,
+                field,
+                levels=levels,
+                colors="black",
+                linewidths=0.55,
+                alpha=0.55,
                 zorder=2,
             )
+    heat_ax.scatter(xs, ys, s=3, c="#AEB8C2", edgecolors="none", alpha=0.35, zorder=3)
+    heat_ax.scatter(
+        [focal_x],
+        [focal_y],
+        s=170,
+        c="#103B73",
+        marker="*",
+        edgecolors="white",
+        linewidths=0.8,
+        zorder=4,
+    )
+    heat_ax.set_title("Smoothed Spatial Influence Field")
+    _style_map_axes(heat_ax, positions, road_segments)
+    heat_cbar = fig.colorbar(im, ax=heat_ax, fraction=0.046, pad=0.02)
+    heat_cbar.set_label("Smoothed influence density")
 
-    if sampled_rows:
-        xs = [row["x"] for row in sampled_rows if row["has_position"]]
-        ys = [row["y"] for row in sampled_rows if row["has_position"]]
-        vals = [row["receptive_field_breadth"] for row in sampled_rows if row["has_position"]]
-        scatter = ax.scatter(
-            xs,
-            ys,
-            s=16 if len(node_labels) > 100 else 55,
-            c=vals,
-            cmap="viridis",
-            edgecolors="white",
-            linewidths=0.6,
-            zorder=4,
-        )
-        cbar = fig.colorbar(scatter, ax=ax, shrink=0.8)
-        cbar.set_label("Influence-weighted receptive field $R_i$")
+    decay_ax = axes[2]
+    decay_ax.set_facecolor("white")
+    hops = np.arange(int(hop_influence_curve.numel()))
+    hop_values = hop_influence_curve.detach().cpu().numpy().astype(np.float64)
+    baseline = float(hop_values[0]) if hop_values.size > 0 else 0.0
+    if baseline > 0.0:
+        hop_values = hop_values / baseline
+    decay_ax.plot(hops.tolist(), hop_values.tolist(), color="#0F4C81", linewidth=2.2, marker="o")
+    decay_ax.fill_between(hops.tolist(), hop_values.tolist(), color="#87AFC7", alpha=0.25)
+    decay_ax.set_xlabel("Hop distance $h$")
+    decay_ax.set_ylabel("$T_h(v) / T_0(v)$")
+    decay_ax.set_title("Hop-Wise Influence Decay")
+    decay_ax.grid(alpha=0.25, linewidth=0.6)
+    source_short = source_node_label.split("\n", maxsplit=1)[0]
+    decay_ax.text(
+        0.03,
+        0.97,
+        f"Source: {source_short}\nR = {receptive_field_breadth(hop_influence_curve):.3f}",
+        transform=decay_ax.transAxes,
+        va="top",
+        ha="left",
+        fontsize=9,
+        bbox={"facecolor": "white", "edgecolor": "#D4D8DD", "alpha": 0.9},
+    )
 
-    if len(node_labels) <= 100:
-        for row in sampled_rows:
-            if not row["has_position"]:
-                continue
-            ax.text(
-                row["x"],
-                row["y"],
-                row["node_label"],
-                fontsize=6,
-                ha="center",
-                va="bottom",
-                zorder=5,
-            )
-
-    ax.set_title(f"Representative Snapshot: Node Influence Breadth [{method_name}]")
-    _style_map_axes(ax, positions, road_segments)
+    fig.suptitle(
+        f"Focal-Node Jacobian Influence [{method_name}] | Source = {source_short}",
+        y=1.02,
+        fontsize=13,
+    )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -694,7 +837,6 @@ def write_node_influence_csv(
     node_rows: list[dict[str, Any]],
     max_hops: int,
 ) -> None:
-    hop_fields = [f"hop_{hop}" for hop in range(max_hops + 1)]
     fieldnames = [
         "node_index",
         "node_id",
@@ -702,9 +844,10 @@ def write_node_influence_csv(
         "x",
         "y",
         "has_position",
-        "is_sampled",
-        "receptive_field_breadth",
-        *hop_fields,
+        "is_source",
+        "hop_distance_from_source",
+        "influence_raw",
+        "influence_normalized",
     ]
 
     with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -750,7 +893,63 @@ def compute_average_total_influence(
     return avg_curve, avg_breadth, curves, breadths
 
 
-def compute_node_influence_rows(
+def _select_focal_node_index(
+    positions: Tensor,
+    attached_rl_ids_by_node: list[tuple[str, ...]],
+    explicit_index: int | None,
+) -> int:
+    if explicit_index is not None:
+        return int(explicit_index)
+
+    valid = torch.isfinite(positions).all(dim=1)
+    if not bool(valid.any()):
+        return 0
+
+    signal_indices = [
+        idx
+        for idx, rl_ids in enumerate(attached_rl_ids_by_node)
+        if rl_ids and bool(valid[idx])
+    ]
+    candidate_indices = signal_indices or [idx for idx in range(len(attached_rl_ids_by_node)) if bool(valid[idx])]
+    candidate_positions = positions[candidate_indices]
+    center = candidate_positions.mean(dim=0)
+    distances = torch.norm(candidate_positions - center, dim=1)
+    best_pos = int(torch.argmin(distances).item())
+    return int(candidate_indices[best_pos])
+
+
+def _shortest_hop_distances(
+    edge_index: Tensor,
+    num_nodes: int,
+    source_node: int,
+) -> list[int]:
+    adjacency: list[set[int]] = [set() for _ in range(num_nodes)]
+    for src, dst in edge_index.t().tolist():
+        src_i = int(src)
+        dst_i = int(dst)
+        if src_i == dst_i:
+            continue
+        adjacency[src_i].add(dst_i)
+        adjacency[dst_i].add(src_i)
+
+    distances = [-1] * num_nodes
+    distances[source_node] = 0
+    queue = [source_node]
+    head = 0
+
+    while head < len(queue):
+        current = queue[head]
+        head += 1
+        for neighbor in adjacency[current]:
+            if distances[neighbor] != -1:
+                continue
+            distances[neighbor] = distances[current] + 1
+            queue.append(neighbor)
+
+    return distances
+
+
+def compute_focal_influence_rows(
     model: nn.Module,
     snapshot: SnapshotGraph,
     positions: Tensor,
@@ -758,15 +957,42 @@ def compute_node_influence_rows(
     attached_rl_ids_by_node: list[tuple[str, ...]],
     *,
     max_hops: int,
-    num_samples: int,
+    focal_node_index: int,
     device: torch.device | str,
-) -> list[dict[str, Any]]:
-    sampled_nodes = set(select_sampled_nodes(snapshot.data.num_nodes, num_samples, seed=snapshot.step_index))
+) -> tuple[list[dict[str, Any]], Tensor]:
+    try:
+        influence = _jacobian_l1_safe(
+            model,
+            snapshot.data,
+            max_hops=max_hops,
+            node_idx=focal_node_index,
+            device=device,
+            vectorize=True,
+        ).detach().cpu()
+    except Exception as exc:  # pragma: no cover - exercised in integration
+        _raise_with_pyg_hint(exc)
+
+    hop_subsets = k_hop_subsets_exact(
+        focal_node_index,
+        max_hops,
+        snapshot.data.edge_index,
+        int(snapshot.data.num_nodes),
+        influence.device,
+    )
+    hop_influence_curve = torch.stack([influence[subset].sum() for subset in hop_subsets]).detach().cpu()
+
+    self_influence = float(influence[focal_node_index].item())
+    normalizer = self_influence if self_influence > 0.0 else float(influence.max().item())
+    if normalizer <= 0.0:
+        normalizer = 1.0
+
+    hop_distances = _shortest_hop_distances(snapshot.data.edge_index, snapshot.data.num_nodes, focal_node_index)
     node_rows: list[dict[str, Any]] = []
 
     for node_idx, node_id in enumerate(node_ids):
         attached_rl_ids = attached_rl_ids_by_node[node_idx]
         has_position = bool(torch.isfinite(positions[node_idx]).all())
+        raw_influence = float(influence[node_idx].item())
         row: dict[str, Any] = {
             "node_index": node_idx,
             "node_id": node_id,
@@ -775,33 +1001,15 @@ def compute_node_influence_rows(
             "x": float(positions[node_idx, 0].item()) if has_position else "",
             "y": float(positions[node_idx, 1].item()) if has_position else "",
             "has_position": has_position,
-            "is_sampled": node_idx in sampled_nodes,
-            "receptive_field_breadth": "",
+            "is_source": node_idx == focal_node_index,
+            "hop_distance_from_source": hop_distances[node_idx],
+            "influence_raw": raw_influence,
+            "influence_normalized": raw_influence / normalizer,
         }
-
-        for hop in range(max_hops + 1):
-            row[f"hop_{hop}"] = ""
-
-        if node_idx in sampled_nodes:
-            try:
-                influence_per_hop = _jacobian_l1_agg_per_hop_safe(
-                    model,
-                    snapshot.data,
-                    max_hops=max_hops,
-                    node_idx=node_idx,
-                    device=device,
-                    vectorize=True,
-                ).detach().cpu()
-            except Exception as exc:  # pragma: no cover - exercised in integration
-                _raise_with_pyg_hint(exc)
-
-            row["receptive_field_breadth"] = receptive_field_breadth(influence_per_hop)
-            for hop, value in enumerate(influence_per_hop.tolist()):
-                row[f"hop_{hop}"] = float(value)
 
         node_rows.append(row)
 
-    return node_rows
+    return node_rows, hop_influence_curve
 
 
 def run_visualization(
@@ -815,6 +1023,14 @@ def run_visualization(
     max_hops: int | None = None,
     curve_num_samples: int | None = None,
     map_num_samples: int | None = None,
+    show_blue_edges_influence_map: bool = True,
+    focal_node_index: int | None = None,
+    show_heat_contours: bool = True,
+    num_heat_contours: int = 6,
+    heat_grid_size: int = 220,
+    heat_sigma_scale: float = 0.06,
+    heat_percentile_low: float = 2.0,
+    heat_percentile_high: float = 98.0,
 ) -> dict[str, Any]:
     """Run graph/influence visualization and save all artifacts."""
     out_dir = Path(out_dir)
@@ -836,6 +1052,7 @@ def run_visualization(
                 strict=True,
             )
         ]
+        node_is_signal = [len(attached_rl_ids) > 0 for attached_rl_ids in attached_rl_ids_by_node]
         positions = env.graph_builder.node_positions.detach().cpu()  # type: ignore[union-attr]
         road_segments = extract_road_segments(env.graph_builder.net)  # type: ignore[union-attr]
         edge_index = td0["edge_index"].detach().cpu()
@@ -872,14 +1089,19 @@ def run_visualization(
     )
 
     representative_snapshot = snapshots[len(snapshots) // 2]
-    node_rows = compute_node_influence_rows(
+    resolved_focal_node_index = _select_focal_node_index(
+        positions,
+        attached_rl_ids_by_node,
+        focal_node_index,
+    )
+    node_rows, focal_hop_curve = compute_focal_influence_rows(
         influence_model,
         representative_snapshot,
         positions,
         node_ids,
         attached_rl_ids_by_node,
         max_hops=resolved_max_hops,
-        num_samples=resolved_map_samples,
+        focal_node_index=resolved_focal_node_index,
         device=device_obj,
     )
 
@@ -888,6 +1110,7 @@ def run_visualization(
         positions,
         edge_index,
         node_labels,
+        node_is_signal,
         method_name=graph_builder_mode,
         road_segments=road_segments,
     )
@@ -904,6 +1127,16 @@ def run_visualization(
         node_labels,
         node_rows,
         method_name=graph_builder_mode,
+        source_node_index=resolved_focal_node_index,
+        source_node_label=node_labels[resolved_focal_node_index],
+        hop_influence_curve=focal_hop_curve,
+        show_blue_edges=show_blue_edges_influence_map,
+        show_heat_contours=show_heat_contours,
+        num_heat_contours=num_heat_contours,
+        heat_grid_size=heat_grid_size,
+        heat_sigma_scale=heat_sigma_scale,
+        heat_percentile_low=heat_percentile_low,
+        heat_percentile_high=heat_percentile_high,
         road_segments=road_segments,
     )
 
@@ -923,6 +1156,11 @@ def run_visualization(
         "max_hops": resolved_max_hops,
         "curve_num_samples": resolved_curve_samples,
         "map_num_samples": resolved_map_samples,
+        "show_blue_edges_influence_map": bool(show_blue_edges_influence_map),
+        "focal_node_index": resolved_focal_node_index,
+        "focal_node_id": node_ids[resolved_focal_node_index],
+        "focal_hop_influence": [float(v) for v in focal_hop_curve.tolist()],
+        "focal_receptive_field_breadth": receptive_field_breadth(focal_hop_curve),
         "avg_total_influence": [float(v) for v in avg_curve.tolist()],
         "avg_receptive_field_breadth": avg_breadth,
         "snapshot_receptive_field_breadths": snapshot_breadths,

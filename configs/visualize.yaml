@@ -8,12 +8,21 @@ runtime:
   checkpoint_path: null
   out_dir: null
   device: cpu
+  use_checkpoint_config: true
 
 analysis:
   num_snapshots: 5
   max_hops: null
   curve_num_samples: null
   map_num_samples: null
+  show_blue_edges_influence_map: false
+  focal_node_index: null
+  show_heat_contours: true
+  num_heat_contours: 6
+  heat_grid_size: 220
+  heat_sigma_scale: 0.06
+  heat_percentile_low: 2.0
+  heat_percentile_high: 98.0
 
 hydra:
   run:
