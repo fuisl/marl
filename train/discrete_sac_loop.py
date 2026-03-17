@@ -418,10 +418,13 @@ def _postprocess_after_training(
             print(f"[postprocess] eval metrics saved -> {eval_file}")
 
             if use_wandb:
-                summary = _summarize_eval_metrics(eval_metrics)
-                if summary:
-                    wandb.log(summary)
-                wandb.save(str(eval_file), base_path=str(out_dir))
+                try:
+                    summary = _summarize_eval_metrics(eval_metrics)
+                    if summary:
+                        wandb.log(summary)
+                    wandb.save(str(eval_file), base_path=str(out_dir))
+                except Exception as exc:  # pragma: no cover - integration/runtime dependent
+                    print(f"[postprocess] wandb sync warning (evaluation): {exc}")
         except Exception as exc:  # pragma: no cover - integration/runtime dependent
             print(f"[postprocess] evaluation failed: {exc}")
 
@@ -448,30 +451,33 @@ def _postprocess_after_training(
             print(f"[postprocess] visualization saved -> {viz_out_dir}")
 
             if use_wandb:
-                wandb.log({
-                    "PostTrain/Visualization/Avg Receptive Field Breadth": float(
-                        vis_summary.get("avg_receptive_field_breadth", 0.0)
-                    ),
-                    "PostTrain/Visualization/Num Nodes": float(vis_summary.get("num_nodes", 0.0)),
-                    "PostTrain/Visualization/Num Undirected Edges": float(
-                        vis_summary.get("num_undirected_edges", 0.0)
-                    ),
-                })
-                artifacts = vis_summary.get("artifacts", {})
-                if isinstance(artifacts, dict):
-                    graph_path = Path(str(artifacts.get("graph_topology", "")))
-                    curve_path = Path(str(artifacts.get("influence_curve", "")))
-                    map_path = Path(str(artifacts.get("influence_map", "")))
-                    if graph_path.exists():
-                        wandb.log({"PostTrain/Visualization/Graph Topology": wandb.Image(str(graph_path))})
-                    if curve_path.exists():
-                        wandb.log({"PostTrain/Visualization/Influence Curve": wandb.Image(str(curve_path))})
-                    if map_path.exists():
-                        wandb.log({"PostTrain/Visualization/Influence Map": wandb.Image(str(map_path))})
-                    for artifact_path in artifacts.values():
-                        artifact_file = Path(str(artifact_path))
-                        if artifact_file.exists():
-                            wandb.save(str(artifact_file), base_path=str(out_dir))
+                try:
+                    wandb.log({
+                        "PostTrain/Visualization/Avg Receptive Field Breadth": float(
+                            vis_summary.get("avg_receptive_field_breadth", 0.0)
+                        ),
+                        "PostTrain/Visualization/Num Nodes": float(vis_summary.get("num_nodes", 0.0)),
+                        "PostTrain/Visualization/Num Undirected Edges": float(
+                            vis_summary.get("num_undirected_edges", 0.0)
+                        ),
+                    })
+                    artifacts = vis_summary.get("artifacts", {})
+                    if isinstance(artifacts, dict):
+                        graph_path = Path(str(artifacts.get("graph_topology", "")))
+                        curve_path = Path(str(artifacts.get("influence_curve", "")))
+                        map_path = Path(str(artifacts.get("influence_map", "")))
+                        if graph_path.exists():
+                            wandb.log({"PostTrain/Visualization/Graph Topology": wandb.Image(str(graph_path))})
+                        if curve_path.exists():
+                            wandb.log({"PostTrain/Visualization/Influence Curve": wandb.Image(str(curve_path))})
+                        if map_path.exists():
+                            wandb.log({"PostTrain/Visualization/Influence Map": wandb.Image(str(map_path))})
+                        for artifact_path in artifacts.values():
+                            artifact_file = Path(str(artifact_path))
+                            if artifact_file.exists():
+                                wandb.save(str(artifact_file), base_path=str(out_dir))
+                except Exception as exc:  # pragma: no cover - integration/runtime dependent
+                    print(f"[postprocess] wandb sync warning (visualization): {exc}")
         except Exception as exc:  # pragma: no cover - integration/runtime dependent
             print(f"[postprocess] visualization failed: {exc}")
 
