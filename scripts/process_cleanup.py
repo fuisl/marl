@@ -62,13 +62,40 @@ def _is_alive(pid: int) -> bool:
     return True
 
 
+def _should_skip_termination(pid: int) -> bool:
+    """Return True for descendant processes that should not be force-killed.
+
+    W&B starts an internal service process for logging. Killing it during
+    parent cleanup can trigger noisy atexit teardown warnings even when data
+    has already been synced.
+    """
+    cmdline_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        raw = cmdline_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+
+    cmdline = raw.replace("\x00", " ").lower()
+    wandb_markers = (
+        "wandb/sdk/service",
+        "wandb service",
+        "wandb-service",
+        "wandb_internal",
+    )
+    return any(marker in cmdline for marker in wandb_markers)
+
+
 def terminate_descendants(
     root_pid: int | None = None,
     *,
     timeout_s: float = 3.0,
 ) -> list[int]:
     """Terminate all descendants of ``root_pid`` and return their PIDs."""
-    pids = descendant_pids(root_pid)
+    descendants = descendant_pids(root_pid)
+    if not descendants:
+        return []
+
+    pids = [pid for pid in descendants if not _should_skip_termination(pid)]
     if not pids:
         return []
 
