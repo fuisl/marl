@@ -112,6 +112,7 @@ def main(cfg: DictConfig) -> None:
         heat_sigma_scale=float(cfg.analysis.heat_sigma_scale),
         heat_percentile_low=float(cfg.analysis.heat_percentile_low),
         heat_percentile_high=float(cfg.analysis.heat_percentile_high),
+        heat_weight_mode=str(cfg.analysis.heat_weight_mode),
     )
 
     print("Visualization complete.")

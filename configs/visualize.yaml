@@ -16,6 +16,8 @@ analysis:
   curve_num_samples: null
   map_num_samples: null
   show_blue_edges_influence_map: false
+  # null => global spatial influence over all nodes
+  # int  => focal-node view for the chosen source node index
   focal_node_index: null
   show_heat_contours: true
   num_heat_contours: 6
@@ -23,6 +25,9 @@ analysis:
   heat_sigma_scale: 0.06
   heat_percentile_low: 2.0
   heat_percentile_high: 98.0
+  # weights used to build smoothed field from node influence values
+  # raw | normalized | log_normalized
+  heat_weight_mode: raw
 
 hydra:
   run:
