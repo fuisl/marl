@@ -631,14 +631,14 @@ def train(cfg: DictConfig) -> dict[str, Any]:
 
         atexit.register(_wandb_atexit)
 
-        # SIGTERM (sent by loky on cleanup) does NOT trigger Python exception
-        # handling by default. Convert it to KeyboardInterrupt so:
-        #   - if it arrives during training, the normal interrupt→postprocess path runs
-        #   - if it arrives during postprocessing, SIG_IGN (set below) blocks it
-        def _sigterm_to_interrupt(signum: int, frame: object) -> None:  # noqa: ANN001
-            raise KeyboardInterrupt()
+        # SIGTERM (sent by loky on cleanup) does NOT trigger atexit by default.
+        # Convert it to a SystemExit so atexit handlers run.
+        _prev_sigterm = signal.getsignal(signal.SIGTERM)
 
-        signal.signal(signal.SIGTERM, _sigterm_to_interrupt)
+        def _sigterm_to_exit(signum: int, frame: object) -> None:  # noqa: ANN001
+            sys.exit(1)
+
+        signal.signal(signal.SIGTERM, _sigterm_to_exit)
 
     # --- Logging ---
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -787,12 +787,6 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             episodes_completed = ep
     except KeyboardInterrupt:
         interrupted = True
-        # Block further SIGTERM signals from loky so the postprocess/visualization
-        # phase can run to completion without being forcibly killed.
-        try:
-            signal.signal(signal.SIGTERM, signal.SIG_IGN)
-        except (OSError, ValueError):
-            pass
         print("\nTraining interrupted. Finalizing and running post-processing...")
         if not best_ckpt_path.exists():
             torch.save(agent.state_dict(), best_ckpt_path)
