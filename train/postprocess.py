@@ -6,10 +6,26 @@ from pathlib import Path
 from typing import Any
 
 import torch
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from config_utils import maybe_to_container, resolve_repo_path
 from train.wandb_utils import SafeWandbRun
+
+
+_CONFIGS_DIR = Path(__file__).resolve().parent.parent / "configs"
+
+
+def _load_config_section(config_name: str, section: str) -> dict[str, Any]:
+    cfg_path = _CONFIGS_DIR / config_name
+    try:
+        cfg = OmegaConf.load(cfg_path)
+    except Exception:
+        return {}
+
+    section_cfg = maybe_to_container(cfg.get(section, {}))
+    if isinstance(section_cfg, dict):
+        return section_cfg
+    return {}
 
 
 def _eval_metric_stats(values: list[float]) -> dict[str, float]:
@@ -74,6 +90,10 @@ def postprocess_after_training(
     wandb_run: SafeWandbRun,
 ) -> None:
     post_cfg = maybe_to_container(cfg.train.get("postprocess", {})) or {}
+    eval_runtime_defaults = _load_config_section("evaluate.yaml", "runtime")
+    viz_runtime_defaults = _load_config_section("visualize.yaml", "runtime")
+    viz_analysis_defaults = _load_config_section("visualize.yaml", "analysis")
+
     run_eval = bool(post_cfg.get("run_evaluation", True))
     run_visual = bool(post_cfg.get("run_visualization", True))
 
@@ -88,14 +108,15 @@ def postprocess_after_training(
         try:
             from train.evaluate import evaluate as run_evaluation
 
-            eval_episodes = int(post_cfg.get("eval_episodes", 5))
-            eval_gui = bool(post_cfg.get("eval_gui", False))
+            eval_episodes = int(post_cfg.get("eval_episodes", eval_runtime_defaults.get("episodes", 5)))
+            eval_gui = bool(post_cfg.get("eval_gui", eval_runtime_defaults.get("gui", False)))
+            eval_device = str(post_cfg.get("eval_device", eval_runtime_defaults.get("device", str(device))))
             eval_metrics = run_evaluation(
                 checkpoint_path=str(checkpoint_path),
                 env_cfg=dict(env_cfg),
                 model_cfg=dict(model_cfg),
                 n_episodes=eval_episodes,
-                device=str(device),
+                device=eval_device,
                 gui=eval_gui,
             )
 
@@ -133,8 +154,99 @@ def postprocess_after_training(
             from visualization.graph_influence import run_visualization
 
             viz_out_raw = post_cfg.get("visualization_out_dir", None)
-            viz_out_dir = resolve_repo_path(viz_out_raw) if viz_out_raw else (post_dir / "visualization")
-            viz_device = str(post_cfg.get("visualization_device", str(device)))
+            default_viz_out = viz_runtime_defaults.get("out_dir", None)
+            if viz_out_raw:
+                viz_out_dir = resolve_repo_path(viz_out_raw)
+            elif default_viz_out not in (None, ""):
+                viz_out_dir = resolve_repo_path(default_viz_out)
+            else:
+                viz_out_dir = post_dir / "visualization"
+
+            viz_device = str(
+                post_cfg.get(
+                    "visualization_device",
+                    viz_runtime_defaults.get("device", str(device)),
+                )
+            )
+
+            num_snapshots = int(
+                post_cfg.get(
+                    "visualization_num_snapshots",
+                    viz_analysis_defaults.get("num_snapshots", 5),
+                )
+            )
+            max_hops = maybe_to_container(
+                post_cfg.get(
+                    "visualization_max_hops",
+                    viz_analysis_defaults.get("max_hops", None),
+                )
+            )
+            curve_num_samples = maybe_to_container(
+                post_cfg.get(
+                    "visualization_curve_num_samples",
+                    viz_analysis_defaults.get("curve_num_samples", None),
+                )
+            )
+            map_num_samples = maybe_to_container(
+                post_cfg.get(
+                    "visualization_map_num_samples",
+                    viz_analysis_defaults.get("map_num_samples", None),
+                )
+            )
+            show_blue_edges = bool(
+                post_cfg.get(
+                    "visualization_show_blue_edges_influence_map",
+                    viz_analysis_defaults.get("show_blue_edges_influence_map", False),
+                )
+            )
+            focal_node_index = maybe_to_container(
+                post_cfg.get(
+                    "visualization_focal_node_index",
+                    viz_analysis_defaults.get("focal_node_index", None),
+                )
+            )
+            show_heat_contours = bool(
+                post_cfg.get(
+                    "visualization_show_heat_contours",
+                    viz_analysis_defaults.get("show_heat_contours", True),
+                )
+            )
+            num_heat_contours = int(
+                post_cfg.get(
+                    "visualization_num_heat_contours",
+                    viz_analysis_defaults.get("num_heat_contours", 6),
+                )
+            )
+            heat_grid_size = int(
+                post_cfg.get(
+                    "visualization_heat_grid_size",
+                    viz_analysis_defaults.get("heat_grid_size", 220),
+                )
+            )
+            heat_sigma_scale = float(
+                post_cfg.get(
+                    "visualization_heat_sigma_scale",
+                    viz_analysis_defaults.get("heat_sigma_scale", 0.06),
+                )
+            )
+            heat_percentile_low = float(
+                post_cfg.get(
+                    "visualization_heat_percentile_low",
+                    viz_analysis_defaults.get("heat_percentile_low", 2.0),
+                )
+            )
+            heat_percentile_high = float(
+                post_cfg.get(
+                    "visualization_heat_percentile_high",
+                    viz_analysis_defaults.get("heat_percentile_high", 98.0),
+                )
+            )
+            heat_weight_mode = str(
+                post_cfg.get(
+                    "visualization_heat_weight_mode",
+                    viz_analysis_defaults.get("heat_weight_mode", "raw"),
+                )
+            )
 
             vis_summary = run_visualization(
                 checkpoint_path=checkpoint_path,
@@ -142,10 +254,19 @@ def postprocess_after_training(
                 model_cfg=dict(model_cfg),
                 out_dir=viz_out_dir,
                 device=viz_device,
-                num_snapshots=int(post_cfg.get("visualization_num_snapshots", 5)),
-                max_hops=maybe_to_container(post_cfg.get("visualization_max_hops", None)),
-                curve_num_samples=maybe_to_container(post_cfg.get("visualization_curve_num_samples", None)),
-                map_num_samples=maybe_to_container(post_cfg.get("visualization_map_num_samples", None)),
+                num_snapshots=num_snapshots,
+                max_hops=max_hops,
+                curve_num_samples=curve_num_samples,
+                map_num_samples=map_num_samples,
+                show_blue_edges_influence_map=show_blue_edges,
+                focal_node_index=focal_node_index,
+                show_heat_contours=show_heat_contours,
+                num_heat_contours=num_heat_contours,
+                heat_grid_size=heat_grid_size,
+                heat_sigma_scale=heat_sigma_scale,
+                heat_percentile_low=heat_percentile_low,
+                heat_percentile_high=heat_percentile_high,
+                heat_weight_mode=heat_weight_mode,
             )
 
             print(f"[postprocess] visualization saved -> {viz_out_dir}")

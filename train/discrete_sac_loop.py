@@ -23,6 +23,7 @@ from __future__ import annotations
 import collections
 from collections.abc import Mapping
 import csv
+import gc
 import random
 import time
 from pathlib import Path
@@ -585,6 +586,15 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     run_on_complete = bool(post_cfg.get("on_complete", True))
     run_on_interrupt = bool(post_cfg.get("on_interrupt", True))
     should_postprocess = post_enabled and ((interrupted and run_on_interrupt) or ((not interrupted) and run_on_complete))
+
+    # Free training graph/optimizer state before post-processing loads models.
+    del loss_fn
+    del replay
+    del optimizers
+    del agent
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     if should_postprocess:
         postprocess_after_training(

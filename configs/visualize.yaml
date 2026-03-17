@@ -7,7 +7,7 @@ defaults:
 runtime:
   checkpoint_path: null
   out_dir: null
-  device: cpu
+  device: cuda
   use_checkpoint_config: true
 
 analysis:

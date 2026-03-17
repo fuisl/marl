@@ -7,7 +7,7 @@ defaults:
 runtime:
   checkpoint_path: null
   episodes: 5
-  device: cpu
+  device: cuda
   gui: false
 
 hydra:
