@@ -16,14 +16,14 @@ analysis:
   curve_num_samples: null
   # If true and curve_num_samples is null, use all nodes (official-style default).
   # If false, keep repo's performance-friendly cap for large graphs.
-  curve_use_all_nodes_when_null: false
+  curve_use_all_nodes_when_null: true
   # seeded_sorted: deterministic and sorted sampled node indices (current repo behavior)
   # official_random: unsorted random order, matching official-style sampling order
-  curve_sampling_mode: seeded_sorted
+  curve_sampling_mode: official_random
   # Optional base seed for curve sampling. null keeps mode defaults.
   curve_sampling_seed: null
   # Optional log-scale y-axis for influence decay curves.
-  curve_log_y: false
+  curve_log_y: true
   map_num_samples: null
   show_blue_edges_influence_map: false
   # null => global spatial influence over all nodes
