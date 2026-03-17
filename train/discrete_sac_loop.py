@@ -20,15 +20,10 @@ Outputs
 
 from __future__ import annotations
 
-import atexit
 import collections
 from collections.abc import Mapping
 import csv
-import json
-import os
 import random
-import signal
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -36,13 +31,6 @@ from typing import Any
 from omegaconf import DictConfig, OmegaConf
 
 from config_utils import load_dotenv, maybe_to_container, resolve_repo_path
-
-
-try:
-    import wandb
-    _WANDB_AVAILABLE = True
-except ImportError:
-    _WANDB_AVAILABLE = False
 
 load_dotenv()
 
@@ -54,6 +42,14 @@ from marl_env.sumo_env import TrafficSignalEnv  # noqa: E402
 from models.marl_discrete_sac import MARLDiscreteSAC  # noqa: E402
 from rl.losses import DiscreteSACLossComputer  # noqa: E402
 from rl.optimizers import make_optimizer  # noqa: E402
+from train.training_logging import (  # noqa: E402
+    TRAIN_LOG_FIELDNAMES,
+    build_train_log_row,
+    build_train_wandb_payload,
+    print_train_progress,
+)
+from train.postprocess import postprocess_after_training  # noqa: E402
+from train.wandb_utils import SafeWandbRun  # noqa: E402
 
 
 # ======================================================================
@@ -359,129 +355,6 @@ def sac_update(
     }
 
 
-def _summarize_eval_metrics(all_metrics: list[dict[str, float]]) -> dict[str, float]:
-    if not all_metrics:
-        return {}
-
-    summary: dict[str, float] = {}
-    keys = list(all_metrics[0].keys())
-    for key in keys:
-        values = [float(m[key]) for m in all_metrics if key in m]
-        if not values:
-            continue
-        summary[f"PostTrain/Eval/{key} Mean"] = sum(values) / len(values)
-        summary[f"PostTrain/Eval/{key} Min"] = min(values)
-        summary[f"PostTrain/Eval/{key} Max"] = max(values)
-
-    summary["PostTrain/Eval/Episodes"] = float(len(all_metrics))
-    return summary
-
-
-def _postprocess_after_training(
-    cfg: DictConfig,
-    *,
-    checkpoint_path: Path,
-    out_dir: Path,
-    env_cfg: dict[str, Any],
-    model_cfg: dict[str, Any],
-    device: torch.device,
-    use_wandb: bool,
-) -> None:
-    post_cfg = maybe_to_container(cfg.train.get("postprocess", {})) or {}
-    run_eval = bool(post_cfg.get("run_evaluation", True))
-    run_visual = bool(post_cfg.get("run_visualization", True))
-
-    if not checkpoint_path.exists():
-        print(f"[postprocess] skip: checkpoint missing at {checkpoint_path}")
-        return
-
-    post_dir = out_dir / "postprocess"
-    post_dir.mkdir(parents=True, exist_ok=True)
-
-    if run_eval:
-        try:
-            from train.evaluate import evaluate as run_evaluation
-
-            eval_episodes = int(post_cfg.get("eval_episodes", 5))
-            eval_gui = bool(post_cfg.get("eval_gui", False))
-            eval_metrics = run_evaluation(
-                checkpoint_path=str(checkpoint_path),
-                env_cfg=dict(env_cfg),
-                model_cfg=dict(model_cfg),
-                n_episodes=eval_episodes,
-                device=str(device),
-                gui=eval_gui,
-            )
-
-            eval_file = post_dir / "eval_metrics.json"
-            eval_file.write_text(json.dumps(eval_metrics, indent=2), encoding="utf-8")
-            print(f"[postprocess] eval metrics saved -> {eval_file}")
-
-            if use_wandb:
-                try:
-                    summary = _summarize_eval_metrics(eval_metrics)
-                    if summary:
-                        wandb.log(summary)
-                    wandb.save(str(eval_file), base_path=str(out_dir))
-                except Exception as exc:  # pragma: no cover - integration/runtime dependent
-                    print(f"[postprocess] wandb sync warning (evaluation): {exc}")
-        except Exception as exc:  # pragma: no cover - integration/runtime dependent
-            print(f"[postprocess] evaluation failed: {exc}")
-
-    if run_visual:
-        try:
-            from visualization.graph_influence import run_visualization
-
-            viz_out_raw = post_cfg.get("visualization_out_dir", None)
-            viz_out_dir = resolve_repo_path(viz_out_raw) if viz_out_raw else (post_dir / "visualization")
-            viz_device = str(post_cfg.get("visualization_device", str(device)))
-
-            vis_summary = run_visualization(
-                checkpoint_path=checkpoint_path,
-                env_cfg=dict(env_cfg),
-                model_cfg=dict(model_cfg),
-                out_dir=viz_out_dir,
-                device=viz_device,
-                num_snapshots=int(post_cfg.get("visualization_num_snapshots", 5)),
-                max_hops=maybe_to_container(post_cfg.get("visualization_max_hops", None)),
-                curve_num_samples=maybe_to_container(post_cfg.get("visualization_curve_num_samples", None)),
-                map_num_samples=maybe_to_container(post_cfg.get("visualization_map_num_samples", None)),
-            )
-
-            print(f"[postprocess] visualization saved -> {viz_out_dir}")
-
-            if use_wandb:
-                try:
-                    wandb.log({
-                        "PostTrain/Visualization/Avg Receptive Field Breadth": float(
-                            vis_summary.get("avg_receptive_field_breadth", 0.0)
-                        ),
-                        "PostTrain/Visualization/Num Nodes": float(vis_summary.get("num_nodes", 0.0)),
-                        "PostTrain/Visualization/Num Undirected Edges": float(
-                            vis_summary.get("num_undirected_edges", 0.0)
-                        ),
-                    })
-                    artifacts = vis_summary.get("artifacts", {})
-                    if isinstance(artifacts, dict):
-                        graph_path = Path(str(artifacts.get("graph_topology", "")))
-                        curve_path = Path(str(artifacts.get("influence_curve", "")))
-                        map_path = Path(str(artifacts.get("influence_map", "")))
-                        if graph_path.exists():
-                            wandb.log({"PostTrain/Visualization/Graph Topology": wandb.Image(str(graph_path))})
-                        if curve_path.exists():
-                            wandb.log({"PostTrain/Visualization/Influence Curve": wandb.Image(str(curve_path))})
-                        if map_path.exists():
-                            wandb.log({"PostTrain/Visualization/Influence Map": wandb.Image(str(map_path))})
-                        for artifact_path in artifacts.values():
-                            artifact_file = Path(str(artifact_path))
-                            if artifact_file.exists():
-                                wandb.save(str(artifact_file), base_path=str(out_dir))
-                except Exception as exc:  # pragma: no cover - integration/runtime dependent
-                    print(f"[postprocess] wandb sync warning (visualization): {exc}")
-        except Exception as exc:  # pragma: no cover - integration/runtime dependent
-            print(f"[postprocess] visualization failed: {exc}")
-
-
 # ======================================================================
 # Training loop
 # ======================================================================
@@ -579,8 +452,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     replay  = ReplayBuffer(int(cfg.train.replay_capacity), seed=seed)
 
     # --- W&B ---
-    use_wandb = _WANDB_AVAILABLE and bool(cfg.wandb.enabled)
-    if use_wandb:
+    wandb_run = SafeWandbRun(enabled=bool(cfg.wandb.enabled))
+    if wandb_run.enabled:
         run_name = cfg.wandb.run_name
         if not run_name:
             run_name = f"gat_a{actor_opt_name}_c{critic_opt_name}_{reward_mode}_seed{seed}"
@@ -588,78 +461,30 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         wandb_cfg: dict[str, Any] | None = None
         if isinstance(wandb_cfg_raw, dict):
             wandb_cfg = {str(k): v for k, v in wandb_cfg_raw.items()}
-        wandb.init(
-            project=str(cfg.wandb.project),
-            name=str(run_name),
-            config=wandb_cfg,
-            dir=str(out_dir),
-            tags=["gat", "discrete-sac", "marl", "sumo-5x5", actor_opt_name, critic_opt_name, reward_mode],
-        )
-        wandb.define_metric("Episode")
-        wandb.define_metric("Learning/*", step_metric="Episode")
-        wandb.define_metric("Traffic/*", step_metric="Episode")
-        wandb.define_metric("RESCO/*", step_metric="Episode")
-        wandb.define_metric("Debug/*", step_metric="Episode")
-
-        run_metadata = {
+        run_metadata: dict[str, Any] = {
             "device": str(device),
             "n_agents": n_agents,
             "obs_dim": obs_dim,
             "num_actions": num_actions,
             "graph_edges": n_edges,
+            "run_name": str(run_name),
             "optimizer_actor": actor_opt_name,
             "optimizer_critic": critic_opt_name,
             "reward_mode": reward_mode,
         }
-        wandb.config.update({"run_metadata": run_metadata}, allow_val_change=True)
-        run_obj = wandb.run
-        if run_obj is not None:
-            run_obj.summary["run_name"] = str(run_name)
-            run_obj.summary["optimizer_actor"] = actor_opt_name
-            run_obj.summary["optimizer_critic"] = critic_opt_name
-            run_obj.summary["reward_mode"] = reward_mode
-            run_obj.summary["n_agents"] = n_agents
-            run_obj.summary["obs_dim"] = obs_dim
-            run_obj.summary["num_actions"] = num_actions
-            run_obj.summary["graph_edges"] = n_edges
-
-        # Guarantee wandb.finish() is called even when the worker process is
-        # killed by the Hydra/loky launcher (SIGTERM/SIGKILL on Ctrl+C).
-        def _wandb_atexit() -> None:
-            if wandb.run is not None:
-                try:
-                    wandb.finish(exit_code=1)
-                except Exception:
-                    pass
-
-        atexit.register(_wandb_atexit)
-
-        # SIGTERM (sent by loky on cleanup) does NOT trigger atexit by default.
-        # Convert it to a SystemExit so atexit handlers run.
-        _prev_sigterm = signal.getsignal(signal.SIGTERM)
-
-        def _sigterm_to_exit(signum: int, frame: object) -> None:  # noqa: ANN001
-            sys.exit(1)
-
-        signal.signal(signal.SIGTERM, _sigterm_to_exit)
+        wandb_run.init_training_run(
+            project=str(cfg.wandb.project),
+            run_name=str(run_name),
+            run_config=wandb_cfg,
+            out_dir=out_dir,
+            tags=["gat", "discrete-sac", "marl", "sumo-5x5", actor_opt_name, critic_opt_name, reward_mode],
+            run_metadata=run_metadata,
+        )
 
     # --- Logging ---
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.csv"
-    fieldnames = [
-        "episode", "n_steps", "return", "return_ma50",
-        "return_per_agent_step",
-        "traffic_avg_travel_time_s", "traffic_avg_wait_s",
-        "traffic_avg_delay_s", "traffic_avg_queue_length",
-        "val_avg_speed_mps", "val_avg_occupancy_pct",
-        "val_avg_min_expected_vehicles",
-        "traffic_network_total_waiting_s", "traffic_network_total_vehicles",
-        "val_total_arrived_vehicles", "val_total_departed_vehicles",
-        "val_total_teleported_vehicles",
-        "critic_loss", "actor_loss", "alpha_loss",
-        "q1", "q2", "entropy", "alpha",
-        "total_transitions", "elapsed_s",
-    ]
+    fieldnames = TRAIN_LOG_FIELDNAMES
     log_f  = log_path.open("w", newline="")
     writer = csv.DictWriter(log_f, fieldnames=fieldnames)
     writer.writeheader()
@@ -705,87 +530,44 @@ def train(cfg: DictConfig) -> dict[str, Any]:
 
             # --- Log CSV ---
             elapsed = time.perf_counter() - t0
-            row: dict[str, Any] = {
-                "episode":           ep,
-                "n_steps":           ep_steps,
-                "return":            round(ep_return, 3),
-                "return_ma50":       round(ma50, 3),
-                "return_per_agent_step": round(return_per_agent_step, 6),
-                "traffic_avg_travel_time_s": round(validation_metrics["avg_travel_time_s"], 4),
-                "traffic_avg_wait_s":         round(validation_metrics["avg_wait_s"], 4),
-                "traffic_avg_delay_s":        round(validation_metrics["avg_delay_s"], 4),
-                "traffic_avg_queue_length":   round(validation_metrics["avg_queue_length"], 4),
-                "val_avg_speed_mps": round(validation_metrics["avg_speed_mps"], 4),
-                "val_avg_occupancy_pct": round(validation_metrics["avg_occupancy_pct"], 4),
-                "val_avg_min_expected_vehicles": round(validation_metrics["avg_min_expected_vehicles"], 4),
-                "traffic_network_total_waiting_s": round(validation_metrics["avg_network_waiting_s_per_decision"], 4),
-                "traffic_network_total_vehicles": round(validation_metrics["avg_network_vehicles_per_decision"], 4),
-                "val_total_arrived_vehicles": round(validation_metrics["total_arrived_vehicles"], 2),
-                "val_total_departed_vehicles": round(validation_metrics["total_departed_vehicles"], 2),
-                "val_total_teleported_vehicles": round(validation_metrics["total_teleported_vehicles"], 2),
-                "total_transitions": total_transitions,
-                "elapsed_s":         round(elapsed, 1),
-                **{k: round(float(v), 5) for k, v in last_metrics.items()},
-            }
+            row = build_train_log_row(
+                episode=ep,
+                n_steps=ep_steps,
+                episode_return=ep_return,
+                ma50=ma50,
+                return_per_agent_step=return_per_agent_step,
+                validation_metrics=validation_metrics,
+                total_transitions=total_transitions,
+                elapsed_s=elapsed,
+                last_metrics=last_metrics,
+            )
             writer.writerow(row)
             log_f.flush()
 
             # --- W&B ---
-            if use_wandb:
-                wandb.log({
-                    # Common x-axis
-                    "Episode": ep,
-
-                    # Learning metrics
-                    "Learning/Reward": ep_return,
-                    "Learning/Reward (MA50)": ma50,
-                    "Learning/Reward Per Agent-Step": return_per_agent_step,
-                    "Learning/Episode Length (steps)": ep_steps,
-                    "Learning/Total Transitions": total_transitions,
-                    "Learning/Elapsed Time (s)": elapsed,
-                    "Learning/Critic Loss": last_metrics.get("critic_loss", float("nan")),
-                    "Learning/Actor Loss": last_metrics.get("actor_loss", float("nan")),
-                    "Learning/Alpha Loss": last_metrics.get("alpha_loss", float("nan")),
-                    "Learning/Q1 Mean": last_metrics.get("q1", float("nan")),
-                    "Learning/Q2 Mean": last_metrics.get("q2", float("nan")),
-                    "Learning/Policy Entropy": last_metrics.get("entropy", float("nan")),
-                    "Learning/Alpha": last_metrics.get("alpha", float("nan")),
-                    "Learning/Best Reward": best_return,
-
-                    # Traffic metrics (truthful names to match implemented formulas)
-                    "Traffic/Average Travel Time (s)": validation_metrics["avg_travel_time_s"],
-                    "Traffic/Average Waiting Time (s)": validation_metrics["avg_wait_s"],
-                    "Traffic/Average Time Loss (s)": validation_metrics["avg_delay_s"],
-                    "Traffic/Average Queue Length": validation_metrics["avg_queue_length"],
-                    "Traffic/Average Speed (m/s)": validation_metrics["avg_speed_mps"],
-                    "Traffic/Average Occupancy (%)": validation_metrics["avg_occupancy_pct"],
-                    "Traffic/Average Min Expected Vehicles": validation_metrics["avg_min_expected_vehicles"],
-                    "Traffic/Average Network Waiting (veh*s per decision)": validation_metrics["avg_network_waiting_s_per_decision"],
-                    "Traffic/Average Network Vehicles (per decision)": validation_metrics["avg_network_vehicles_per_decision"],
-                    "Traffic/Arrived Vehicles": validation_metrics["total_arrived_vehicles"],
-                    "Traffic/Departed Vehicles": validation_metrics["total_departed_vehicles"],
-                    "Traffic/Teleported Vehicles": validation_metrics["total_teleported_vehicles"],
-
-                    # RESCO-compatible aliases for easier cross-plotting
-                    "RESCO/duration": validation_metrics["avg_travel_time_s"],
-                    "RESCO/waitingTime": validation_metrics["avg_wait_s"],
-                    "RESCO/timeLoss": validation_metrics["avg_delay_s"],
-                    "RESCO/queue_lengths": validation_metrics["avg_queue_length"],
-                    "RESCO/rewards": ep_return,
-                    "RESCO/vehicles": validation_metrics["total_departed_vehicles"],
-                })
-
+            wandb_run.log(
+                build_train_wandb_payload(
+                    episode=ep,
+                    episode_return=ep_return,
+                    ma50=ma50,
+                    return_per_agent_step=return_per_agent_step,
+                    n_steps=ep_steps,
+                    total_transitions=total_transitions,
+                    elapsed_s=elapsed,
+                    best_return=best_return,
+                    validation_metrics=validation_metrics,
+                    last_metrics=last_metrics,
+                )
+            )
             # --- Console ---
             if ep % int(cfg.train.log_interval) == 0 or ep == 1:
-                cl = last_metrics.get("critic_loss", float("nan"))
-                al = last_metrics.get("actor_loss",  float("nan"))
-                en = last_metrics.get("entropy",     float("nan"))
-                a  = last_metrics.get("alpha",       float("nan"))
-                warm_tag = "" if total_transitions >= int(cfg.train.warmup) else " [warmup]"
-                print(
-                    f"{ep:6d}  {ep_return:10.2f}  {ma50:10.2f}"
-                    f"  {cl:9.4f}  {al:9.4f}  {en:9.4f}  {a:7.4f}"
-                    f"  {total_transitions:7d}{warm_tag}"
+                print_train_progress(
+                    episode=ep,
+                    episode_return=ep_return,
+                    ma50=ma50,
+                    total_transitions=total_transitions,
+                    warmup=int(cfg.train.warmup),
+                    last_metrics=last_metrics,
                 )
             episodes_completed = ep
     except KeyboardInterrupt:
@@ -805,26 +587,27 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     should_postprocess = post_enabled and ((interrupted and run_on_interrupt) or ((not interrupted) and run_on_complete))
 
     if should_postprocess:
-        _postprocess_after_training(
+        postprocess_after_training(
             cfg,
             checkpoint_path=best_ckpt_path,
             out_dir=out_dir,
             env_cfg=maybe_to_container(cfg.env),
             model_cfg=maybe_to_container(cfg.model),
             device=device,
-            use_wandb=use_wandb,
+            wandb_run=wandb_run,
         )
 
-    if use_wandb:
-        if best_ckpt_path.exists():
-            wandb.save(str(best_ckpt_path), base_path=str(out_dir))
-        run_obj = wandb.run
-        if run_obj is not None:
-            run_obj.summary["interrupted"] = bool(interrupted)
-            run_obj.summary["episodes_completed"] = int(episodes_completed)
-            run_obj.summary["best_return"] = float(best_return)
-            exit_code = 1 if interrupted else 0
-            wandb.finish(exit_code=exit_code)
+    if best_ckpt_path.exists():
+        wandb_run.save(best_ckpt_path, base_path=out_dir)
+    wandb_run.set_summary(
+        {
+            "interrupted": bool(interrupted),
+            "episodes_completed": int(episodes_completed),
+            "best_return": float(best_return),
+        }
+    )
+    exit_code = 1 if interrupted else 0
+    wandb_run.finish(exit_code=exit_code)
 
     print("-" * 85)
     print(f"\nDone.  Best return: {best_return:.2f}")

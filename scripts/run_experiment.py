@@ -45,7 +45,6 @@ def _handle_signal(signum: int, _frame: Any) -> None:
     if _INTERRUPTED:
         raise SystemExit(130)
     _INTERRUPTED = True
-    _cleanup_workers()
     raise KeyboardInterrupt(f"Received signal {signum}")
 
 
