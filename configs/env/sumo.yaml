@@ -9,6 +9,7 @@ common:
   gui: false
   additional_files: null
   graph_builder_mode: all_intersections
+  timeloss_subscription_policy: strict
 
   reward_mode: pressure_queue
   reward_weights:

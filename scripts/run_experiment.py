@@ -100,9 +100,16 @@ def main(cfg: DictConfig) -> None:
 
     trainer = str(cfg.algo.trainer)
     if trainer == "discrete_sac":
-        result = _run_training(cfg, env_cfg)
-        if bool(result.get("interrupted", False)):
-            raise KeyboardInterrupt("Training interrupted by signal")
+        try:
+            _run_training(cfg, env_cfg)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            # Exceptions escaping the training loop may carry traceback frames
+            # that hold libsumo SWIG objects, which are not picklable by loky.
+            # Re-raise as a plain RuntimeError with a clean traceback so loky
+            # can serialize the failure and report it to the parent process.
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from None
         return
     if trainer == "fixed_time_baseline":
         run_baseline(

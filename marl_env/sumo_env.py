@@ -15,7 +15,7 @@ from torch import Tensor
 from marl_env.action_constraints import ActionConstraints
 from marl_env.graph_builder import GraphBuilder
 from marl_env.reward import IntersectionMetrics, RewardCalculator
-from marl_env.traci_adapter import TraCIAdapter, _VAR_ACCUM_WAITING, _VAR_TIME_LOSS
+from marl_env.traci_adapter import TraCIAdapter
 
 
 class TrafficSignalEnv:
@@ -63,6 +63,7 @@ class TrafficSignalEnv:
         end_time: int = 3600,
         additional_files: list[str] | None = None,
         graph_builder_mode: str = "original",
+        timeloss_subscription_policy: str = "strict",
     ) -> None:
         self.delta_t = delta_t
         self.net_file = net_file
@@ -78,6 +79,7 @@ class TrafficSignalEnv:
             begin_time=begin_time,
             end_time=end_time,
             additional_files=additional_files,
+            timeloss_subscription_policy=timeloss_subscription_policy,
         )
 
         # --- Reward ---
@@ -261,9 +263,9 @@ class TrafficSignalEnv:
                 self._episode_travel_time_sum_s += max(0.0, now - t_depart)
                 self._episode_arrived_vehicles += 1
                 # Subscription results stay readable for one step after arrival.
-                sub = self.adapter.get_vehicle_subscription_results(vid)
-                self._episode_wait_time_sum_s += float(sub.get(_VAR_ACCUM_WAITING, 0.0))
-                self._episode_time_loss_sum_s += float(sub.get(_VAR_TIME_LOSS, 0.0))
+                wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
+                self._episode_wait_time_sum_s += wait_s
+                self._episode_time_loss_sum_s += delay_s
 
         self._last_interval_flow = {
             "arrived_vehicles": arrived_total,

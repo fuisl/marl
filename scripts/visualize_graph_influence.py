@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -16,9 +15,6 @@ from config_utils import load_dotenv, maybe_to_container, resolve_repo_path
 
 
 load_dotenv()
-
-# Prefer libsumo for visualization runs, matching the training script.
-os.environ.setdefault("LIBSUMO_AS_TRACI", "1")
 
 from visualization.graph_influence import run_visualization  # noqa: E402
 
