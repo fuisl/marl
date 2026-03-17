@@ -118,6 +118,8 @@ class TrafficSignalEnv:
             "teleported_vehicles": 0.0,
         }
         self._depart_time_by_vehicle: dict[str, float] = {}
+        self._last_wait_time_by_vehicle: dict[str, float] = {}
+        self._last_time_loss_by_vehicle: dict[str, float] = {}
         self._episode_travel_time_sum_s: float = 0.0
         self._episode_arrived_vehicles: int = 0
         # Per-vehicle benchmark accumulators (NeurIPS RESCO definitions)
@@ -138,6 +140,8 @@ class TrafficSignalEnv:
         self.adapter.close()  # no-op on first call
         self.adapter.start()
         self._depart_time_by_vehicle = {}
+        self._last_wait_time_by_vehicle = {}
+        self._last_time_loss_by_vehicle = {}
         self._episode_travel_time_sum_s = 0.0
         self._episode_arrived_vehicles = 0
         self._episode_wait_time_sum_s = 0.0
@@ -250,20 +254,44 @@ class TrafficSignalEnv:
                 self._depart_time_by_vehicle.setdefault(vid, now)
                 self.adapter.subscribe_vehicle(vid)
 
+            arrived_ids = self.adapter.get_arrived_ids()
+            arrived_set = set(arrived_ids)
+
+            # libsumo may no longer expose vehicle metrics once a vehicle is
+            # in arrived IDs, so cache last known values while vehicles are active.
+            for vid in list(self._depart_time_by_vehicle.keys()):
+                if vid in arrived_set:
+                    continue
+                try:
+                    wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
+                except Exception:
+                    continue
+                self._last_wait_time_by_vehicle[vid] = wait_s
+                self._last_time_loss_by_vehicle[vid] = delay_s
+
             # Accumulate time-averaged queue: total halting vehicles this sim step.
             self._sim_step_queue_sum += float(
                 sum(self.adapter.get_lane_halting_number(l) for l in self._all_controlled_lanes)
             )
             self._sim_step_count += 1
 
-            for vid in self.adapter.get_arrived_ids():
+            for vid in arrived_ids:
                 t_depart = self._depart_time_by_vehicle.pop(vid, None)
                 if t_depart is None:
                     continue
                 self._episode_travel_time_sum_s += max(0.0, now - t_depart)
                 self._episode_arrived_vehicles += 1
-                # Subscription results stay readable for one step after arrival.
-                wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
+
+                wait_s = self._last_wait_time_by_vehicle.pop(vid, 0.0)
+                delay_s = self._last_time_loss_by_vehicle.pop(vid, 0.0)
+                if wait_s == 0.0 and delay_s == 0.0:
+                    # Best effort fallback for runtimes that still allow
+                    # one-step post-arrival access.
+                    try:
+                        wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
+                    except Exception:
+                        pass
+
                 self._episode_wait_time_sum_s += wait_s
                 self._episode_time_loss_sum_s += delay_s
 
