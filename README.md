@@ -13,7 +13,7 @@ python scripts/run_experiment.py
 This command composes config groups and dispatches to one of:
 
 - `discrete_sac` training loop
-- `fixed_time_baseline` rollout
+- RESCO static baseline rollout (`fixed`, `stochastic`, `maxwave`, `maxpressure`)
 
 ## Config Layout
 
@@ -34,7 +34,7 @@ Top-level composition is defined in `configs/run.yaml`.
 
 Default values come from `configs/run.yaml` + selected groups:
 
-- `scenario=grid5x5`
+- `scenario=grid4x4`
 - `algo=discrete_sac`
 - `seed=21`
 - `project=marl-traffic-gat`
@@ -53,7 +53,7 @@ python scripts/run_experiment.py experiment=grid5x5
 python scripts/run_experiment.py scenario=cologne8 algo=discrete_sac
 
 # Run fixed-time baseline
-python scripts/run_experiment.py algo=fixed_time_baseline
+python scripts/run_experiment.py algo=fixed
 ```
 
 ## Useful Overrides
@@ -130,4 +130,5 @@ Common variables:
 
 ## Additional Docs
 
-For full parameter reference and config examples, see `configs/README.md`.
+For the current environment contract, observation layout, graph metadata, and
+metric semantics, see [marl_env/README.md](/home/tuancuong/data5t/marl/marl_env/README.md).
