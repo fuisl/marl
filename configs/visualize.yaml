@@ -8,7 +8,6 @@ runtime:
   checkpoint_path: null
   out_dir: null
   device: cuda
-  use_checkpoint_config: true
 
 analysis:
   num_snapshots: 5

@@ -199,6 +199,7 @@ def run_baseline(
             },
             dir=str(Path(out_dir) if out_dir is not None else Path.cwd()),
             tags=["baseline", "fixed-time"],
+            settings=wandb.Settings(start_method="thread"),
         )
         wandb.define_metric("Episode")
         wandb.define_metric("Traffic/*", step_metric="Episode")
