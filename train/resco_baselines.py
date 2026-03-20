@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from itertools import islice, permutations
 from math import factorial
+import random
 from typing import Any
 
 
@@ -84,10 +85,20 @@ def select_phase_pair_action(
     *,
     values_by_direction: dict[str, float],
     phase_pairs: list[list[str]],
+    candidate_action_indices: list[int] | None = None,
 ) -> int:
-    best_action = 0
+    candidates = (
+        list(range(len(phase_pairs)))
+        if candidate_action_indices is None
+        else list(candidate_action_indices)
+    )
+    if not candidates:
+        raise ValueError("At least one candidate action is required.")
+
+    best_action = int(candidates[0])
     best_score = float("-inf")
-    for action_idx, pair in enumerate(phase_pairs):
+    for action_idx in candidates:
+        pair = phase_pairs[action_idx]
         score = 0.0
         for direction in pair:
             score += float(values_by_direction.get(direction, 0.0))
@@ -109,6 +120,45 @@ def build_direction_value_map(
     }
 
 
+def _valid_global_actions(spec: dict[str, Any]) -> list[int]:
+    pair_to_act_map = spec.get("pair_to_act_map", {})
+    if not isinstance(pair_to_act_map, dict) or not pair_to_act_map:
+        raise ValueError("Signal spec is missing pair_to_act_map.")
+    return sorted(int(global_idx) for global_idx in pair_to_act_map)
+
+
+def _select_mapped_local_action(
+    *,
+    spec: dict[str, Any],
+    values_by_direction: dict[str, float],
+) -> int:
+    phase_pairs = list(spec["phase_pairs"])
+    pair_to_act_map = {
+        int(global_idx): int(local_idx)
+        for global_idx, local_idx in spec["pair_to_act_map"].items()
+    }
+    best_global_action = select_phase_pair_action(
+        values_by_direction=values_by_direction,
+        phase_pairs=phase_pairs,
+        candidate_action_indices=_valid_global_actions(spec),
+    )
+    return int(pair_to_act_map[best_global_action])
+
+
+def stochastic_actions(
+    *,
+    signal_specs: dict[str, dict[str, Any]],
+    rng: random.Random,
+) -> dict[str, int]:
+    actions: dict[str, int] = {}
+    for signal_id, spec in signal_specs.items():
+        num_actions = int(spec["local_num_actions"])
+        if num_actions <= 0:
+            raise ValueError(f"Signal {signal_id!r} exposes no local actions.")
+        actions[signal_id] = int(rng.randrange(num_actions))
+    return actions
+
+
 def maxwave_actions(
     *,
     signal_specs: dict[str, dict[str, Any]],
@@ -120,9 +170,9 @@ def maxwave_actions(
             directions=list(spec["directions"]),
             values=list(wave_states.get(signal_id, [])),
         )
-        actions[signal_id] = select_phase_pair_action(
+        actions[signal_id] = _select_mapped_local_action(
+            spec=spec,
             values_by_direction=values_by_direction,
-            phase_pairs=list(spec["phase_pairs"]),
         )
     return actions
 
@@ -140,8 +190,8 @@ def maxpressure_actions(
             directions=list(spec["directions"]),
             values=directional_pressures,
         )
-        actions[signal_id] = select_phase_pair_action(
+        actions[signal_id] = _select_mapped_local_action(
+            spec=spec,
             values_by_direction=values_by_direction,
-            phase_pairs=list(spec["phase_pairs"]),
         )
     return actions

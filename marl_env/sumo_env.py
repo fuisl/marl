@@ -690,6 +690,8 @@ class TrafficSignalEnv:
             specs[tl_id] = {
                 "directions": list(signal.directions),
                 "phase_pairs": [list(pair) for pair in self._resco_phase_pairs],
+                "pair_to_act_map": dict(sorted(signal.pair_to_act_map.items())),
+                "local_num_actions": int(signal.local_num_actions),
                 "fixed_timings": list(signal.fixed_timings),
                 "fixed_phase_order_idx": int(signal.fixed_phase_order_idx),
                 "fixed_offset": int(signal.fixed_offset),
@@ -768,12 +770,54 @@ class TrafficSignalEnv:
                 raise KeyError(
                     f"Traffic light {tl_id!r} is missing from vendored RESCO metadata for {self.net_file!r}."
                 )
-            if len(self._green_phases.get(tl_id, [])) != len(self._resco_phase_pairs):
+            signal_meta = dict(self._resco_map_metadata[tl_id])
+            pair_to_act_map = {
+                int(global_idx): int(local_idx)
+                for global_idx, local_idx in signal_meta.get("pair_to_act_map", {}).items()
+            }
+            if not pair_to_act_map:
                 raise ValueError(
-                    f"Traffic light {tl_id!r} exposes {len(self._green_phases.get(tl_id, []))} green phases, "
-                    f"but RESCO metadata for {self.net_file!r} expects {len(self._resco_phase_pairs)} phase-pair actions."
+                    f"Traffic light {tl_id!r} is missing a RESCO pair_to_act_map for {self.net_file!r}."
                 )
-            signal_meta = self._resco_map_metadata[tl_id]
+
+            local_actions = sorted(set(pair_to_act_map.values()))
+            if local_actions != list(range(len(local_actions))):
+                raise ValueError(
+                    f"Traffic light {tl_id!r} uses non-contiguous RESCO local actions {local_actions}."
+                )
+
+            green_phase_count = len(self._green_phases.get(tl_id, []))
+            if green_phase_count < len(local_actions):
+                raise ValueError(
+                    f"Traffic light {tl_id!r} exposes {green_phase_count} green phases, "
+                    f"but RESCO metadata for {self.net_file!r} resolves to {len(local_actions)} local actions."
+                )
+            if green_phase_count > len(local_actions):
+                benchmark_green_phases = list(self._green_phases[tl_id][: len(local_actions)])
+                filtered_yellow_map = {
+                    pair: phase
+                    for pair, phase in self._yellow_phase_map[tl_id].items()
+                    if pair[0] in benchmark_green_phases and pair[1] in benchmark_green_phases
+                }
+                filtered_all_red_map = {
+                    pair: phase
+                    for pair, phase in self._all_red_phase_map[tl_id].items()
+                    if pair[0] in benchmark_green_phases and pair[1] in benchmark_green_phases
+                }
+                self._green_phases[tl_id] = benchmark_green_phases
+                self.constraints.register_agent(
+                    tl_id,
+                    num_phases=self._get_num_phases(tl_id),
+                    green_phase_indices=benchmark_green_phases,
+                    yellow_phase_map=filtered_yellow_map,
+                    all_red_phase_map=filtered_all_red_map,
+                )
+                if self._current_green[tl_id] not in benchmark_green_phases:
+                    self._current_green[tl_id] = benchmark_green_phases[0]
+                    self._elapsed_green[tl_id] = 0.0
+                    self._pending_target_green[tl_id] = None
+                    self.adapter.set_phase(tl_id, benchmark_green_phases[0])
+            signal_meta["pair_to_act_map"] = pair_to_act_map
             lane_ids: list[str] = []
             for lane_group in signal_meta["lane_sets"].values():
                 for lane_id in lane_group:

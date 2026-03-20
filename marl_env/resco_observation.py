@@ -185,6 +185,11 @@ class RescoSignalState:
         self.fixed_timings = [int(x) for x in signal_meta.get("fixed_timings", [])]
         self.fixed_phase_order_idx = int(signal_meta.get("fixed_phase_order_idx", 0))
         self.fixed_offset = int(signal_meta.get("fixed_offset", 0))
+        self.pair_to_act_map: dict[int, int] = {
+            int(global_idx): int(local_idx)
+            for global_idx, local_idx in signal_meta.get("pair_to_act_map", {}).items()
+        }
+        self.local_num_actions = len(set(self.pair_to_act_map.values()))
 
         self.lanes: list[str] = []
         self.outbound_lanes: list[str] = []

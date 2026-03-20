@@ -8,6 +8,6 @@ supports:
 
 env_overrides:
   benchmark_mode: resco
-  observation_mode: graph
+  observation_mode: wave
   reward_mode: wait
   step_length: 5

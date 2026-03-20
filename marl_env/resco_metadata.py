@@ -19,7 +19,10 @@ eNrtXU2P2zjS/i/21QnIokRKubVlXXXxQYdBYPROerMBku6g04t3gEH++0tSIllFldR2Wz1f28DOxnpI
 """.strip()
 
 
-SUPPORTED_RESC0_MAPS = (
+_RESERVED_MAP_KEYS = frozenset({"phase_pairs", "pair_to_act_map"})
+
+
+SUPPORTED_RESCO_MAPS = (
     "grid4x4",
     "arterial4x4",
     "cologne1",
@@ -38,6 +41,174 @@ def _normalize_map_name_from_net(net_file: str) -> str:
     return Path(net_name).stem
 
 
+def _iter_signal_ids(map_metadata: dict[str, Any]) -> list[str]:
+    signal_ids: list[str] = []
+    for signal_id, signal_meta in map_metadata.items():
+        if signal_id in _RESERVED_MAP_KEYS:
+            continue
+        if not isinstance(signal_meta, dict):
+            continue
+        if "lane_sets" not in signal_meta or "downstream" not in signal_meta:
+            continue
+        signal_ids.append(str(signal_id))
+    return signal_ids
+
+
+def _normalize_phase_pairs(raw_phase_pairs: Any) -> list[list[str]]:
+    if not isinstance(raw_phase_pairs, list):
+        raise TypeError("RESCO phase_pairs must be a list.")
+
+    phase_pairs: list[list[str]] = []
+    for pair in raw_phase_pairs:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise TypeError(f"Invalid RESCO phase pair {pair!r}.")
+        phase_pairs.append([str(pair[0]), str(pair[1])])
+    return phase_pairs
+
+
+def _normalize_pair_mapping_entry(raw_key: Any, raw_value: Any) -> list[tuple[int, int]]:
+    if raw_value is not None:
+        return [(int(raw_key), int(raw_value))]
+
+    if isinstance(raw_key, str) and ":" in raw_key:
+        left, right = raw_key.split(":", 1)
+        return [(int(left), int(right))]
+
+    # Upstream signal.yaml contains a malformed inline mapping on cologne8.
+    # YAML 1.1 parses entries such as `1:1` as sexagesimal 61 with a null value.
+    key_int = int(raw_key)
+    left, right = divmod(key_int, 60)
+    return [(left, right)]
+
+
+def _normalize_pair_to_act_map(
+    raw_pair_map: Any,
+    *,
+    phase_pairs: list[list[str]],
+    signal_ids: list[str],
+) -> dict[str, dict[int, int]]:
+    identity = {
+        int(idx): int(idx)
+        for idx in range(len(phase_pairs))
+    }
+    if raw_pair_map is None:
+        return {
+            signal_id: dict(identity)
+            for signal_id in signal_ids
+        }
+    if not isinstance(raw_pair_map, dict):
+        raise TypeError("RESCO pair_to_act_map must be a mapping or null.")
+
+    normalized: dict[str, dict[int, int]] = {}
+    for signal_id, raw_signal_map in raw_pair_map.items():
+        if not isinstance(raw_signal_map, dict):
+            raise TypeError(
+                f"RESCO pair_to_act_map[{signal_id!r}] must be a mapping."
+            )
+        signal_mapping: dict[int, int] = {}
+        for raw_key, raw_value in raw_signal_map.items():
+            for global_idx, local_idx in _normalize_pair_mapping_entry(raw_key, raw_value):
+                signal_mapping[int(global_idx)] = int(local_idx)
+        normalized[str(signal_id)] = signal_mapping
+    return normalized
+
+
+def _validate_resco_map_metadata(map_name: str, metadata: dict[str, Any]) -> None:
+    phase_pairs = metadata.get("phase_pairs")
+    if not isinstance(phase_pairs, list) or not phase_pairs:
+        raise ValueError(f"RESCO metadata for {map_name!r} is missing phase_pairs.")
+
+    signal_ids = _iter_signal_ids(metadata)
+    if not signal_ids:
+        raise ValueError(f"RESCO metadata for {map_name!r} does not define any signals.")
+
+    pair_to_act_map = metadata.get("pair_to_act_map")
+    if not isinstance(pair_to_act_map, dict):
+        raise ValueError(f"RESCO metadata for {map_name!r} is missing pair_to_act_map.")
+
+    for signal_id in signal_ids:
+        signal_meta = metadata[signal_id]
+        mapping = pair_to_act_map.get(signal_id)
+        if not isinstance(mapping, dict) or not mapping:
+            raise ValueError(
+                f"RESCO metadata for {map_name!r} signal {signal_id!r} has no valid action mapping."
+            )
+        seen_local_actions: set[int] = set()
+        for global_idx, local_idx in mapping.items():
+            if not isinstance(global_idx, int) or not isinstance(local_idx, int):
+                raise TypeError(
+                    f"RESCO mapping for {map_name!r} signal {signal_id!r} must use integer indices."
+                )
+            if global_idx < 0 or global_idx >= len(phase_pairs):
+                raise ValueError(
+                    f"RESCO mapping for {map_name!r} signal {signal_id!r} references "
+                    f"global phase index {global_idx}, but only {len(phase_pairs)} exist."
+                )
+            if local_idx < 0:
+                raise ValueError(
+                    f"RESCO mapping for {map_name!r} signal {signal_id!r} references "
+                    f"invalid local action index {local_idx}."
+                )
+            seen_local_actions.add(local_idx)
+
+        expected_local = list(range(len(seen_local_actions)))
+        if sorted(seen_local_actions) != expected_local:
+            raise ValueError(
+                f"RESCO mapping for {map_name!r} signal {signal_id!r} must use contiguous "
+                f"local actions starting at 0; got {sorted(seen_local_actions)}."
+            )
+
+        if not isinstance(signal_meta.get("lane_sets"), dict):
+            raise TypeError(
+                f"RESCO metadata for {map_name!r} signal {signal_id!r} is missing lane_sets."
+            )
+        if not isinstance(signal_meta.get("downstream"), dict):
+            raise TypeError(
+                f"RESCO metadata for {map_name!r} signal {signal_id!r} is missing downstream."
+            )
+
+
+def _normalize_map_metadata(map_name: str, raw_metadata: Any) -> dict[str, Any]:
+    if not isinstance(raw_metadata, dict):
+        raise TypeError(f"Vendored metadata for map {map_name!r} is malformed.")
+
+    phase_pairs = _normalize_phase_pairs(raw_metadata.get("phase_pairs"))
+    signal_ids = _iter_signal_ids(raw_metadata)
+    pair_to_act_map = _normalize_pair_to_act_map(
+        raw_metadata.get("pair_to_act_map"),
+        phase_pairs=phase_pairs,
+        signal_ids=signal_ids,
+    )
+
+    normalized: dict[str, Any] = {
+        "phase_pairs": phase_pairs,
+        "pair_to_act_map": pair_to_act_map,
+    }
+    for signal_id in signal_ids:
+        raw_signal_meta = raw_metadata[signal_id]
+        signal_meta = dict(raw_signal_meta)
+        signal_meta["lane_sets"] = {
+            str(direction): [str(lane_id) for lane_id in lanes]
+            for direction, lanes in raw_signal_meta["lane_sets"].items()
+        }
+        signal_meta["downstream"] = {
+            str(direction): (None if downstream is None else str(downstream))
+            for direction, downstream in raw_signal_meta["downstream"].items()
+        }
+        signal_meta["fixed_timings"] = [
+            int(value) for value in raw_signal_meta.get("fixed_timings", [])
+        ]
+        signal_meta["fixed_phase_order_idx"] = int(
+            raw_signal_meta.get("fixed_phase_order_idx", 0)
+        )
+        signal_meta["fixed_offset"] = int(raw_signal_meta.get("fixed_offset", 0))
+        signal_meta["pair_to_act_map"] = dict(pair_to_act_map.get(signal_id, {}))
+        normalized[signal_id] = signal_meta
+
+    _validate_resco_map_metadata(map_name, normalized)
+    return normalized
+
+
 @lru_cache(maxsize=1)
 def load_resco_signal_metadata() -> dict[str, Any]:
     payload = base64.b64decode(_RESCO_SIGNAL_METADATA_B64)
@@ -45,7 +216,10 @@ def load_resco_signal_metadata() -> dict[str, Any]:
     data = json.loads(decoded)
     if not isinstance(data, dict):
         raise TypeError("Vendored RESCO signal metadata is malformed.")
-    return data
+    return {
+        str(map_name): _normalize_map_metadata(str(map_name), map_metadata)
+        for map_name, map_metadata in data.items()
+    }
 
 
 def get_resco_map_metadata(*, map_name: str | None = None, net_file: str | None = None) -> dict[str, Any]:

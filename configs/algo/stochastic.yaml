@@ -1,4 +1,4 @@
-name: FIXED
+name: STOCHASTIC
 trainer: fixed_time_baseline
 kind: baseline
 
@@ -8,6 +8,7 @@ supports:
 
 env_overrides:
   benchmark_mode: resco
-  observation_mode: wave
+  observation_mode: mplight
   reward_mode: wait
   step_length: 5
+  benchmark_max_distance: 200
