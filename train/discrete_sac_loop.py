@@ -224,30 +224,13 @@ def run_episode(
     -------
     transitions : list[TensorDict]
         Packed single-step transitions (CPU tensors).
-    total_reward : float
-        Sum of all agent rewards over the episode.
     n_steps : int
         Number of RL decision steps taken.
     validation_metrics : dict[str, float]
-        Episode-aggregated network-level KPIs.
+        Episode-aggregated RESCO benchmark metrics.
     """
     td = env.reset().to(device)
     transitions: list[TensorDict] = []
-    total_reward = 0.0
-    avg_metric_keys = (
-        "avg_speed_mps",
-        "avg_occupancy_pct",
-        "min_expected_vehicles",
-        "network_total_waiting_s",
-        "network_total_vehicles",
-    )
-    total_metric_keys = (
-        "arrived_vehicles",
-        "departed_vehicles",
-        "teleported_vehicles",
-    )
-    metric_sums: dict[str, float] = {k: 0.0 for k in avg_metric_keys + total_metric_keys}
-    n_decisions = 0
 
     while True:
         obs = td.get("graph_observation", td["agents", "observation"])
@@ -270,35 +253,12 @@ def run_episode(
         next_td = env.step(actions.cpu()).to(device)
         transitions.append(pack_transition(td.cpu(), actions.cpu(), next_td.cpu()))
 
-        total_reward += float(next_td["agents", "reward"].sum().item())
-        interval_kpis = env.get_interval_kpis()
-        for key in avg_metric_keys + total_metric_keys:
-            metric_sums[key] += float(interval_kpis.get(key, 0.0))
-        n_decisions += 1
-
         if next_td["done"].item():
             break
         td = next_td
 
-    episode_kpis = env.get_episode_kpis()
-    validation_metrics = {
-        # Benchmark-accurate per-completed-vehicle metrics (NeurIPS RESCO definitions)
-        "avg_travel_time_s": float(episode_kpis.get("avg_travel_time_s", 0.0)),
-        "avg_wait_s":         float(episode_kpis.get("avg_wait_s", 0.0)),
-        "avg_delay_s":        float(episode_kpis.get("avg_delay_s", 0.0)),
-        "avg_queue_length":   float(episode_kpis.get("avg_queue_length", 0.0)),
-        # Interval-averaged monitoring stats (not benchmark metrics)
-        "avg_speed_mps": metric_sums["avg_speed_mps"] / max(n_decisions, 1),
-        "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(n_decisions, 1),
-        "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(n_decisions, 1),
-        # These are decision-time averages of network totals, not episode totals.
-        "avg_network_waiting_s_per_decision": metric_sums["network_total_waiting_s"] / max(n_decisions, 1),
-        "avg_network_vehicles_per_decision": metric_sums["network_total_vehicles"] / max(n_decisions, 1),
-        "total_arrived_vehicles": metric_sums["arrived_vehicles"],
-        "total_departed_vehicles": metric_sums["departed_vehicles"],
-        "total_teleported_vehicles": metric_sums["teleported_vehicles"],
-    }
-    return transitions, total_reward, len(transitions), validation_metrics
+    validation_metrics = dict(env.get_episode_kpis())
+    return transitions, float(validation_metrics.get("global_reward", 0.0)), len(transitions), validation_metrics
 
 
 # ======================================================================
@@ -366,6 +326,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     seed = int(cfg.train.seed)
     base_optimizer_name = str(cfg.train.optimizer.name)
     reward_mode = str(cfg.env.reward_mode)
+    if str(getattr(cfg.env, "benchmark_mode", "native")) != "resco":
+        raise ValueError("The public training benchmark path requires env.benchmark_mode='resco'.")
     print(f"[train_gat_baseline] device={device}")
     print(f"  net:   {cfg.env.net_file}")
     print(f"  route: {cfg.env.route_file}")
@@ -381,6 +343,7 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         net_file=cfg.env.net_file,
         route_file=cfg.env.route_file,
         delta_t=int(cfg.env.delta_t),
+        step_length=int(cfg.env.step_length) if getattr(cfg.env, "step_length", None) is not None else None,
         reward_mode=cfg.env.reward_mode,
         reward_weights=maybe_to_container(cfg.env.reward_weights),
         yellow_duration=int(cfg.env.yellow_duration),
@@ -393,6 +356,10 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         additional_files=additional_files,
         graph_builder_mode=str(getattr(cfg.env, "graph_builder_mode", "original")),
         timeloss_subscription_policy=str(getattr(cfg.env, "timeloss_subscription_policy", "strict")),
+        benchmark_mode=str(getattr(cfg.env, "benchmark_mode", "native")),
+        observation_mode=str(getattr(cfg.env, "observation_mode", "graph")),
+        benchmark_max_distance=int(getattr(cfg.env, "benchmark_max_distance", 200)),
+        benchmark_output_dir=str(out_dir),
     )
 
     td0 = env.reset()
@@ -424,7 +391,6 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     print(f"  agent params: {total_params:,}")
 
     # --- Optimizers ---
-    optim_cfg_default = maybe_to_container(cfg.train.optimizer)
     optim_actor_cfg = maybe_to_container(cfg.train.get("optimizer_actor", cfg.train.optimizer))
     optim_critic_cfg = maybe_to_container(cfg.train.get("optimizer_critic", cfg.train.optimizer))
     optim_alpha_cfg = maybe_to_container(cfg.train.get("optimizer_alpha", cfg.train.optimizer))
@@ -478,7 +444,7 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             run_name=str(run_name),
             run_config=wandb_cfg,
             out_dir=out_dir,
-            tags=["gat", "discrete-sac", "marl", "sumo-5x5", actor_opt_name, critic_opt_name, reward_mode],
+            tags=["gat", "discrete-sac", "resco", actor_opt_name, critic_opt_name, reward_mode],
             run_metadata=run_metadata,
         )
 
@@ -491,18 +457,19 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     writer.writeheader()
 
     # --- Training ---
-    best_return       = float("-inf")
+    best_global_reward = float("-inf")
     total_transitions = 0
-    return_history: collections.deque[float] = collections.deque(maxlen=50)
     last_metrics: dict[str, Any] = {}
     t0 = time.perf_counter()
     interrupted = False
     episodes_completed = 0
     best_ckpt_path = out_dir / "best_agent.pt"
 
-    print(f"\n{'Ep':>6}  {'Return':>10}  {'MA-50':>10}  {'CriticL':>9}"
-          f"  {'ActorL':>9}  {'Entropy':>9}  {'Alpha':>7}  {'Trans':>7}")
-    print("-" * 85)
+    print(
+        f"\n{'Ep':>6}  {'Global R':>12}  {'Avg R':>10}  {'Avg Dur':>10}"
+        f"  {'Avg Wait':>10}  {'Avg Loss':>10}  {'Avg Queue':>10}  {'Trans':>9}"
+    )
+    print("-" * 100)
 
     try:
         for ep in range(1, int(cfg.train.episodes) + 1):
@@ -513,10 +480,6 @@ def train(cfg: DictConfig) -> dict[str, Any]:
                 replay.push(t)
             total_transitions += len(transitions)
 
-            return_history.append(ep_return)
-            ma50 = sum(return_history) / len(return_history)
-            return_per_agent_step = ep_return / max(ep_steps * n_agents, 1)
-
             # --- Gradient updates (one per new transition, after warmup) ---
             if total_transitions >= int(cfg.train.warmup):
                 for _ in range(len(transitions) * int(cfg.train.updates_per_step)):
@@ -525,8 +488,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
                         last_metrics = m
 
             # --- Checkpoint ---
-            if ep_return > best_return:
-                best_return = ep_return
+            if ep_return > best_global_reward:
+                best_global_reward = ep_return
                 torch.save(agent.state_dict(), best_ckpt_path)
 
             # --- Log CSV ---
@@ -534,13 +497,9 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             row = build_train_log_row(
                 episode=ep,
                 n_steps=ep_steps,
-                episode_return=ep_return,
-                ma50=ma50,
-                return_per_agent_step=return_per_agent_step,
                 validation_metrics=validation_metrics,
                 total_transitions=total_transitions,
                 elapsed_s=elapsed,
-                last_metrics=last_metrics,
             )
             writer.writerow(row)
             log_f.flush()
@@ -549,26 +508,19 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             wandb_run.log(
                 build_train_wandb_payload(
                     episode=ep,
-                    episode_return=ep_return,
-                    ma50=ma50,
-                    return_per_agent_step=return_per_agent_step,
                     n_steps=ep_steps,
+                    validation_metrics=validation_metrics,
                     total_transitions=total_transitions,
                     elapsed_s=elapsed,
-                    best_return=best_return,
-                    validation_metrics=validation_metrics,
-                    last_metrics=last_metrics,
+                    best_global_reward=best_global_reward,
                 )
             )
             # --- Console ---
             if ep % int(cfg.train.log_interval) == 0 or ep == 1:
                 print_train_progress(
                     episode=ep,
-                    episode_return=ep_return,
-                    ma50=ma50,
+                    validation_metrics=validation_metrics,
                     total_transitions=total_transitions,
-                    warmup=int(cfg.train.warmup),
-                    last_metrics=last_metrics,
                 )
             episodes_completed = ep
     except KeyboardInterrupt:
@@ -613,14 +565,14 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         {
             "interrupted": bool(interrupted),
             "episodes_completed": int(episodes_completed),
-            "best_return": float(best_return),
+            "Best Global Reward": float(best_global_reward),
         }
     )
     exit_code = 1 if interrupted else 0
     wandb_run.finish(exit_code=exit_code)
 
-    print("-" * 85)
-    print(f"\nDone.  Best return: {best_return:.2f}")
+    print("-" * 100)
+    print(f"\nDone.  Best Global Reward: {best_global_reward:.2f}")
     print(f"  checkpoint → {best_ckpt_path}")
     print(f"  log        → {log_path}")
 
@@ -630,4 +582,3 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         "best_checkpoint": str(best_ckpt_path),
         "out_dir": str(out_dir),
     }
-

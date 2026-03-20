@@ -1,6 +1,6 @@
 defaults:
   - env: sumo
-  - scenario: grid5x5
+  - scenario: grid4x4
   - model: default
   - _self_
 
@@ -9,6 +9,7 @@ runtime:
   episodes: 5
   device: cuda
   gui: false
+  out_dir: .
 
 hydra:
   run:

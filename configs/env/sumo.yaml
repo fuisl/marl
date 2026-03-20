@@ -4,17 +4,19 @@ action_space: discrete
 obs_space: graph
 
 common:
-  delta_t: 5
+  delta_t: 10
+  step_length: 10
   sumo_binary: sumo
   gui: false
   additional_files: null
   graph_builder_mode: all_intersections
   timeloss_subscription_policy: strict
+  benchmark_mode: resco
+  observation_mode: graph
+  benchmark_max_distance: 200
 
-  reward_mode: pressure_queue
-  reward_weights:
-    pressure: 1.0
-    queue: 0.1
+  reward_mode: wait
+  reward_weights: null
 
   yellow_duration: 3
   all_red_duration: 2

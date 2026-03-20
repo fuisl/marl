@@ -12,6 +12,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from config_utils import load_dotenv, resolve_repo_path
+from marl_env.resco_reporting import to_public_metrics
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 
@@ -26,6 +27,7 @@ def evaluate(
     n_episodes: int = 5,
     device: str = "cpu",
     gui: bool = False,
+    output_dir: str | None = None,
 ) -> list[dict[str, float]]:
     """Load a checkpoint and evaluate for ``n_episodes``.
 
@@ -36,6 +38,10 @@ def evaluate(
     """
     # Override GUI setting for visual evaluation
     env_cfg = {**env_cfg, "gui": gui}
+    if str(env_cfg.get("benchmark_mode", "native")) != "resco":
+        raise ValueError("The public evaluation benchmark path requires benchmark_mode='resco'.")
+    if output_dir not in (None, ""):
+        env_cfg.setdefault("benchmark_output_dir", output_dir)
 
     env = TrafficSignalEnv(**env_cfg)
     td0 = env.reset()
@@ -51,25 +57,10 @@ def evaluate(
     agent.load_state_dict(state_dict)
     agent.eval()
 
-    avg_metric_keys = (
-        "avg_speed_mps",
-        "avg_occupancy_pct",
-        "min_expected_vehicles",
-        "network_total_waiting_s",
-        "network_total_vehicles",
-    )
-    total_metric_keys = (
-        "arrived_vehicles",
-        "departed_vehicles",
-        "teleported_vehicles",
-    )
-
     all_metrics: list[dict[str, float]] = []
     for ep in range(n_episodes):
         td = env.reset().to(device)
-        total_reward = 0.0
         steps = 0
-        metric_sums: dict[str, float] = {k: 0.0 for k in avg_metric_keys + total_metric_keys}
 
         while True:
             obs = td.get("graph_observation", td["agents", "observation"])
@@ -88,34 +79,17 @@ def evaluate(
             )
 
             next_td = env.step(actions.cpu()).to(device)
-            total_reward += float(next_td["agents", "reward"].sum().item())
-            interval = env.get_interval_kpis()
-            for key in avg_metric_keys + total_metric_keys:
-                metric_sums[key] += float(interval.get(key, 0.0))
             steps += 1
 
             if next_td["done"].item():
                 break
             td = next_td
 
-        episode_kpis = env.get_episode_kpis()
+        episode_kpis = dict(env.get_episode_kpis())
         enriched_info = {
-            "episode_return": total_reward,
-            "episode_length": float(steps),
-            # Benchmark-accurate per-completed-vehicle metrics (NeurIPS RESCO)
-            "avg_travel_time_s": float(episode_kpis.get("avg_travel_time_s", 0.0)),
-            "avg_wait_s":         float(episode_kpis.get("avg_wait_s", 0.0)),
-            "avg_delay_s":        float(episode_kpis.get("avg_delay_s", 0.0)),
-            "avg_queue_length":   float(episode_kpis.get("avg_queue_length", 0.0)),
-            # Interval-averaged monitoring stats
-            "avg_speed_mps": metric_sums["avg_speed_mps"] / max(steps, 1),
-            "avg_occupancy_pct": metric_sums["avg_occupancy_pct"] / max(steps, 1),
-            "avg_min_expected_vehicles": metric_sums["min_expected_vehicles"] / max(steps, 1),
-            "avg_network_waiting_s_per_decision": metric_sums["network_total_waiting_s"] / max(steps, 1),
-            "avg_network_vehicles_per_decision": metric_sums["network_total_vehicles"] / max(steps, 1),
-            "total_arrived_vehicles": metric_sums["arrived_vehicles"],
-            "total_departed_vehicles": metric_sums["departed_vehicles"],
-            "total_teleported_vehicles": metric_sums["teleported_vehicles"],
+            "Episode": float(ep + 1),
+            "Episode Length": float(steps),
+            **to_public_metrics(episode_kpis),
         }
         print(f"Episode {ep + 1}/{n_episodes}: {enriched_info}")
         all_metrics.append(enriched_info)
@@ -123,19 +97,21 @@ def evaluate(
     env.close()
 
     # Summary
-    avg_return = sum(m["episode_return"] for m in all_metrics) / n_episodes
-    avg_length = sum(m["episode_length"] for m in all_metrics) / n_episodes
-    avg_travel_time = sum(m["avg_travel_time_s"] for m in all_metrics) / n_episodes
-    avg_wait = sum(m["avg_wait_s"] for m in all_metrics) / n_episodes
-    avg_delay = sum(m["avg_delay_s"] for m in all_metrics) / n_episodes
-    avg_queue = sum(m["avg_queue_length"] for m in all_metrics) / n_episodes
+    avg_length = sum(m["Episode Length"] for m in all_metrics) / n_episodes
+    avg_duration = sum(m["Avg Duration"] for m in all_metrics) / n_episodes
+    avg_wait = sum(m["Avg Waiting Time"] for m in all_metrics) / n_episodes
+    avg_time_loss = sum(m["Avg Time Loss"] for m in all_metrics) / n_episodes
+    avg_queue = sum(m["Avg Queue Length"] for m in all_metrics) / n_episodes
+    avg_reward = sum(m["Avg Reward"] for m in all_metrics) / n_episodes
+    global_reward = sum(m["Global Reward"] for m in all_metrics) / n_episodes
     print(f"\n--- Evaluation summary ({n_episodes} episodes) ---")
-    print(f"  Avg return:      {avg_return:.2f}")
-    print(f"  Avg length:      {avg_length:.1f}")
-    print(f"  Avg travel time: {avg_travel_time:.2f} s")
-    print(f"  Avg wait:        {avg_wait:.2f} s")
-    print(f"  Avg time loss:   {avg_delay:.2f} s")
-    print(f"  Avg queue:       {avg_queue:.2f}")
+    print(f"  Episode Length:  {avg_length:.1f}")
+    print(f"  Avg Duration:    {avg_duration:.2f}")
+    print(f"  Avg Waiting Time:{avg_wait:.2f}")
+    print(f"  Avg Time Loss:   {avg_time_loss:.2f}")
+    print(f"  Avg Queue Length:{avg_queue:.2f}")
+    print(f"  Avg Reward:      {avg_reward:.2f}")
+    print(f"  Global Reward:   {global_reward:.2f}")
 
     return all_metrics
 
@@ -159,6 +135,7 @@ def main(cfg: DictConfig) -> None:
         n_episodes=int(cfg.runtime.episodes),
         device=str(cfg.runtime.device),
         gui=bool(cfg.runtime.gui),
+        output_dir=str(resolve_repo_path(cfg.runtime.get("out_dir", "."))),
     )
 
 

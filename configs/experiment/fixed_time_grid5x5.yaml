@@ -1,6 +1,6 @@
 defaults:
   - override /algo: fixed_time_baseline
-  - override /scenario: grid5x5
+  - override /scenario: grid4x4
   - _self_
 
-tags: [baseline, fixed_time, grid5x5]
+tags: [baseline, fixed_time, grid4x4]

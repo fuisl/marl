@@ -51,10 +51,19 @@ class SafeWandbRun:
             settings=_wandb.Settings(start_method="thread"),
         )
         _wandb.define_metric("Episode")
-        _wandb.define_metric("Learning/*", step_metric="Episode")
-        _wandb.define_metric("Traffic/*", step_metric="Episode")
-        _wandb.define_metric("RESCO/*", step_metric="Episode")
-        _wandb.define_metric("Debug/*", step_metric="Episode")
+        for metric_name in (
+            "Episode Length",
+            "Total Transitions",
+            "Elapsed Time (s)",
+            "Avg Duration",
+            "Avg Waiting Time",
+            "Avg Time Loss",
+            "Avg Queue Length",
+            "Avg Reward",
+            "Global Reward",
+            "Best Global Reward",
+        ):
+            _wandb.define_metric(metric_name, step_metric="Episode")
 
         _wandb.config.update({"run_metadata": dict(run_metadata)}, allow_val_change=True)
         run_obj = _wandb.run

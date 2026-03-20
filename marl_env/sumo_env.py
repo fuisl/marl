@@ -6,7 +6,10 @@ level and per-agent tensors nested under ``"agents"``.
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
 from typing import Any
+import xml.etree.ElementTree as ET
 
 import torch
 from tensordict import TensorDict
@@ -15,7 +18,21 @@ from torch import Tensor
 from marl_env.action_constraints import ActionConstraints
 from marl_env.graph_builder import GraphBuilder
 from marl_env.reward import IntersectionMetrics, RewardCalculator
-from marl_env.traci_adapter import TraCIAdapter
+from marl_env.resco_metadata import get_resco_map_metadata
+from marl_env.resco_observation import (
+    RescoSignalState,
+    build_drq_states,
+    build_mplight_states,
+    build_wave_states,
+    compute_pressure_rewards,
+    compute_wait_rewards,
+    make_resco_vehicle,
+)
+from marl_env.resco_reporting import (
+    RESCO_RAW_CSV_FIELDS,
+    load_episode_raw_metrics,
+)
+from marl_env.traci_adapter import TraCIAdapter, tc
 
 
 class TrafficSignalEnv:
@@ -52,6 +69,7 @@ class TrafficSignalEnv:
         route_file: str,
         *,
         delta_t: int = 5,
+        step_length: int | None = None,
         reward_mode: str = "combined",
         reward_weights: dict[str, float] | None = None,
         yellow_duration: int = 3,
@@ -64,10 +82,24 @@ class TrafficSignalEnv:
         additional_files: list[str] | None = None,
         graph_builder_mode: str = "original",
         timeloss_subscription_policy: str = "strict",
+        benchmark_mode: str = "native",
+        observation_mode: str = "graph",
+        benchmark_max_distance: int = 200,
+        benchmark_output_dir: str | None = None,
     ) -> None:
-        self.delta_t = delta_t
+        self.benchmark_mode = benchmark_mode
+        self.observation_mode = observation_mode
+        if step_length is not None:
+            delta_t = int(step_length)
+        self.delta_t = int(delta_t)
         self.net_file = net_file
+        self.route_file = route_file
         self.graph_builder_mode = graph_builder_mode
+        self.reward_mode = reward_mode
+        self.benchmark_max_distance = int(benchmark_max_distance)
+        self.benchmark_output_dir = (
+            None if benchmark_output_dir in (None, "") else Path(str(benchmark_output_dir))
+        )
 
         # --- SUMO adapter ---
         self.adapter = TraCIAdapter(
@@ -75,11 +107,12 @@ class TrafficSignalEnv:
             route_file=route_file,
             sumo_binary=sumo_binary,
             gui=gui,
-            delta_t=delta_t,
+            delta_t=self.delta_t,
             begin_time=begin_time,
             end_time=end_time,
             additional_files=additional_files,
             timeloss_subscription_policy=timeloss_subscription_policy,
+            benchmark_mode=benchmark_mode,
         )
 
         # --- Reward ---
@@ -131,6 +164,16 @@ class TrafficSignalEnv:
         self._all_controlled_lanes: set[str] = set()
         self._node_incoming_lanes: dict[str, list[str]] = {}
         self._node_attached_rl_ids: dict[str, tuple[str, ...]] = {}
+        self._benchmark_episode_index: int = 0
+        self._benchmark_tripinfo_path: Path | None = None
+        self._benchmark_metrics_path: Path | None = None
+        self._benchmark_metrics_rows: list[dict[str, Any]] = []
+        self._benchmark_episode_global_reward: float = 0.0
+        self._benchmark_last_episode_raw_metrics: dict[str, float] = {}
+        self._resco_map_metadata: dict[str, Any] = {}
+        self._resco_phase_pairs: list[list[str]] = []
+        self._resco_signals: dict[str, RescoSignalState] = {}
+        self._route_vehicle_count_cache: int | None = None
 
     # ==================================================================
     # Core gym-like interface
@@ -138,6 +181,8 @@ class TrafficSignalEnv:
     def reset(self) -> TensorDict:
         """Start a new episode. Returns initial observation ``TensorDict``."""
         self.adapter.close()  # no-op on first call
+        self._benchmark_episode_index += 1
+        self._prepare_benchmark_artifacts()
         self.adapter.start()
         self._depart_time_by_vehicle = {}
         self._last_wait_time_by_vehicle = {}
@@ -148,6 +193,9 @@ class TrafficSignalEnv:
         self._episode_time_loss_sum_s = 0.0
         self._sim_step_queue_sum = 0.0
         self._sim_step_count = 0
+        self._benchmark_metrics_rows = []
+        self._benchmark_episode_global_reward = 0.0
+        self._benchmark_last_episode_raw_metrics = {}
 
         # Discover agents
         self.tl_ids = self.adapter.get_traffic_light_ids()
@@ -215,6 +263,9 @@ class TrafficSignalEnv:
             lane for lanes in self._controlled_lanes.values() for lane in lanes
         }
 
+        if self.benchmark_mode == "resco":
+            self._initialize_resco_benchmark_state()
+
         return self._build_tensordict()
 
     def step(self, actions: Tensor) -> TensorDict:
@@ -247,53 +298,55 @@ class TrafficSignalEnv:
             arrived_total += float(self.adapter.get_arrived_number())
             departed_total += float(self.adapter.get_departed_number())
             teleported_total += float(self.adapter.get_teleported_number())
+            if self.benchmark_mode == "resco":
+                self._collect_resco_context_snapshots()
+            else:
+                now = float(self.adapter.current_time)
+                for vid in self.adapter.get_departed_ids():
+                    # Record departure time and subscribe to per-vehicle stats.
+                    self._depart_time_by_vehicle.setdefault(vid, now)
+                    self.adapter.subscribe_vehicle(vid)
 
-            now = float(self.adapter.current_time)
-            for vid in self.adapter.get_departed_ids():
-                # Record departure time and subscribe to per-vehicle stats.
-                self._depart_time_by_vehicle.setdefault(vid, now)
-                self.adapter.subscribe_vehicle(vid)
+                arrived_ids = self.adapter.get_arrived_ids()
+                arrived_set = set(arrived_ids)
 
-            arrived_ids = self.adapter.get_arrived_ids()
-            arrived_set = set(arrived_ids)
-
-            # libsumo may no longer expose vehicle metrics once a vehicle is
-            # in arrived IDs, so cache last known values while vehicles are active.
-            for vid in list(self._depart_time_by_vehicle.keys()):
-                if vid in arrived_set:
-                    continue
-                try:
-                    wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
-                except Exception:
-                    continue
-                self._last_wait_time_by_vehicle[vid] = wait_s
-                self._last_time_loss_by_vehicle[vid] = delay_s
-
-            # Accumulate time-averaged queue: total halting vehicles this sim step.
-            self._sim_step_queue_sum += float(
-                sum(self.adapter.get_lane_halting_number(l) for l in self._all_controlled_lanes)
-            )
-            self._sim_step_count += 1
-
-            for vid in arrived_ids:
-                t_depart = self._depart_time_by_vehicle.pop(vid, None)
-                if t_depart is None:
-                    continue
-                self._episode_travel_time_sum_s += max(0.0, now - t_depart)
-                self._episode_arrived_vehicles += 1
-
-                wait_s = self._last_wait_time_by_vehicle.pop(vid, 0.0)
-                delay_s = self._last_time_loss_by_vehicle.pop(vid, 0.0)
-                if wait_s == 0.0 and delay_s == 0.0:
-                    # Best effort fallback for runtimes that still allow
-                    # one-step post-arrival access.
+                # libsumo may no longer expose vehicle metrics once a vehicle is
+                # in arrived IDs, so cache last known values while vehicles are active.
+                for vid in list(self._depart_time_by_vehicle.keys()):
+                    if vid in arrived_set:
+                        continue
                     try:
                         wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
                     except Exception:
-                        pass
+                        continue
+                    self._last_wait_time_by_vehicle[vid] = wait_s
+                    self._last_time_loss_by_vehicle[vid] = delay_s
 
-                self._episode_wait_time_sum_s += wait_s
-                self._episode_time_loss_sum_s += delay_s
+                # Accumulate time-averaged queue: total halting vehicles this sim step.
+                self._sim_step_queue_sum += float(
+                    sum(self.adapter.get_lane_halting_number(l) for l in self._all_controlled_lanes)
+                )
+                self._sim_step_count += 1
+
+                for vid in arrived_ids:
+                    t_depart = self._depart_time_by_vehicle.pop(vid, None)
+                    if t_depart is None:
+                        continue
+                    self._episode_travel_time_sum_s += max(0.0, now - t_depart)
+                    self._episode_arrived_vehicles += 1
+
+                    wait_s = self._last_wait_time_by_vehicle.pop(vid, 0.0)
+                    delay_s = self._last_time_loss_by_vehicle.pop(vid, 0.0)
+                    if wait_s == 0.0 and delay_s == 0.0:
+                        # Best effort fallback for runtimes that still allow
+                        # one-step post-arrival access.
+                        try:
+                            wait_s, delay_s = self.adapter.get_vehicle_benchmark_metrics(vid)
+                        except Exception:
+                            pass
+
+                    self._episode_wait_time_sum_s += wait_s
+                    self._episode_time_loss_sum_s += delay_s
 
         self._last_interval_flow = {
             "arrived_vehicles": arrived_total,
@@ -301,11 +354,19 @@ class TrafficSignalEnv:
             "teleported_vehicles": teleported_total,
         }
 
+        if self.benchmark_mode == "resco":
+            self._finalize_resco_observations()
+
         # --- Build output ---
         td = self._build_tensordict()
 
         # Rewards
-        rewards = self._compute_rewards()
+        if self.benchmark_mode == "resco":
+            rewards = self._compute_resco_rewards()
+            self._benchmark_episode_global_reward += float(rewards.sum().item())
+            self._record_resco_metrics_step(rewards)
+        else:
+            rewards = self._compute_rewards()
         td["agents", "reward"] = rewards.unsqueeze(-1)  # [n_agents, 1]
 
         # Done
@@ -316,6 +377,9 @@ class TrafficSignalEnv:
         td["done"] = torch.tensor([done], dtype=torch.bool)
         td["agents", "done"] = torch.full((self.n_agents, 1), done, dtype=torch.bool)
 
+        if done and self.benchmark_mode == "resco":
+            self._finalize_resco_episode()
+
         return td
 
     def close(self) -> None:
@@ -323,6 +387,8 @@ class TrafficSignalEnv:
 
     def get_interval_kpis(self) -> dict[str, float]:
         """Return network-level KPIs for the latest decision interval."""
+        if self.benchmark_mode == "resco":
+            return {}
         lane_ids: set[str] = set()
         for lanes in self._controlled_lanes.values():
             lane_ids.update(lanes)
@@ -375,6 +441,9 @@ class TrafficSignalEnv:
         avg_queue_length  : mean over sim steps of total halting vehicles
         arrived_vehicles  : number of vehicles counted
         """
+        if self.benchmark_mode == "resco":
+            return dict(self._benchmark_last_episode_raw_metrics)
+
         n = self._episode_arrived_vehicles
         avg_travel_time = self._episode_travel_time_sum_s / n if n > 0 else 0.0
         avg_wait = self._episode_wait_time_sum_s / n if n > 0 else 0.0
@@ -399,6 +468,12 @@ class TrafficSignalEnv:
         (queue + wait + occupancy + speed, per lane, padded)
         (phase one-hot, padded) + elapsed green.
         """
+        if self.benchmark_mode == "resco":
+            if not self.tl_ids:
+                return 0
+            state_mode = "wave" if self.observation_mode == "graph" else self.observation_mode
+            sample = self._build_resco_state_tensor(self.tl_ids[0], state_mode)
+            return int(sample.shape[-1])
         return 4 * self._max_lanes + self._max_green + 1
 
     @property
@@ -409,13 +484,23 @@ class TrafficSignalEnv:
         return max(len(v) for v in self._green_phases.values())
 
     def _build_tensordict(self) -> TensorDict:
-        obs_list: list[Tensor] = []
-
-        for tl_id in self.tl_ids:
-            obs_list.append(self._get_observation(tl_id))
-
-        obs = torch.stack(obs_list, dim=0)  # [n_agents, d_obs]
-        graph_obs = self._build_graph_observation(obs)
+        if self.benchmark_mode == "resco":
+            state_mode = "wave" if self.observation_mode == "graph" else self.observation_mode
+            state_dict = self.get_resco_states(state_mode)
+            obs = torch.stack(
+                [torch.tensor(state_dict[tl_id], dtype=torch.float32) for tl_id in self.tl_ids],
+                dim=0,
+            )
+            if self.observation_mode == "graph":
+                graph_obs = self._build_resco_graph_observation(state_dict)
+            else:
+                graph_obs = obs.clone()
+        else:
+            obs_list: list[Tensor] = []
+            for tl_id in self.tl_ids:
+                obs_list.append(self._get_observation(tl_id))
+            obs = torch.stack(obs_list, dim=0)  # [n_agents, d_obs]
+            graph_obs = self._build_graph_observation(obs)
 
         # Action masks
         masks: list[Tensor] = []
@@ -530,6 +615,35 @@ class TrafficSignalEnv:
         ]
         return torch.stack(graph_obs_list, dim=0)
 
+    def _build_resco_graph_observation(
+        self,
+        state_dict: dict[str, list[float]],
+    ) -> Tensor:
+        if self.graph_builder_mode != "all_intersections":
+            return torch.stack(
+                [torch.tensor(state_dict[tl_id], dtype=torch.float32) for tl_id in self.tl_ids],
+                dim=0,
+            )
+
+        feature_dim = len(next(iter(state_dict.values()))) if state_dict else 0
+        zero = torch.zeros(feature_dim, dtype=torch.float32)
+        graph_obs_list: list[Tensor] = []
+        for node_id in self.graph_node_ids:
+            attached_rl_ids = self._node_attached_rl_ids.get(node_id, ())
+            if not attached_rl_ids:
+                graph_obs_list.append(zero.clone())
+                continue
+            features = [
+                torch.tensor(state_dict[tl_id], dtype=torch.float32)
+                for tl_id in attached_rl_ids
+                if tl_id in state_dict
+            ]
+            if not features:
+                graph_obs_list.append(zero.clone())
+                continue
+            graph_obs_list.append(torch.stack(features, dim=0).mean(dim=0))
+        return torch.stack(graph_obs_list, dim=0)
+
     def _get_graph_node_observation(self, node_id: str) -> Tensor:
         attached_rl_ids = self._node_attached_rl_ids.get(node_id, ())
         phase_owner = attached_rl_ids[0] if attached_rl_ids else None
@@ -558,6 +672,290 @@ class TrafficSignalEnv:
             node_lanes[node_id] = lane_ids
 
         return node_lanes
+
+    # ==================================================================
+    # RESCO benchmark helpers
+    # ==================================================================
+    def get_resco_phase_pairs(self) -> list[list[str]]:
+        if self.benchmark_mode != "resco":
+            raise RuntimeError("RESCO phase pairs are only available in benchmark_mode='resco'.")
+        return [list(pair) for pair in self._resco_phase_pairs]
+
+    def get_resco_signal_specs(self) -> dict[str, dict[str, Any]]:
+        if self.benchmark_mode != "resco":
+            raise RuntimeError("RESCO signal specs are only available in benchmark_mode='resco'.")
+        specs: dict[str, dict[str, Any]] = {}
+        for tl_id in self.tl_ids:
+            signal = self._resco_signals[tl_id]
+            specs[tl_id] = {
+                "directions": list(signal.directions),
+                "phase_pairs": [list(pair) for pair in self._resco_phase_pairs],
+                "fixed_timings": list(signal.fixed_timings),
+                "fixed_phase_order_idx": int(signal.fixed_phase_order_idx),
+                "fixed_offset": int(signal.fixed_offset),
+            }
+        return specs
+
+    def get_benchmark_artifact_paths(self) -> dict[str, str]:
+        if self.benchmark_mode != "resco":
+            return {}
+        paths: dict[str, str] = {}
+        if self._benchmark_tripinfo_path is not None:
+            paths["tripinfo"] = str(self._benchmark_tripinfo_path)
+        if self._benchmark_metrics_path is not None:
+            paths["metrics"] = str(self._benchmark_metrics_path)
+        return paths
+
+    def get_resco_states(self, mode: str | None = None) -> dict[str, list[float]]:
+        if self.benchmark_mode != "resco":
+            raise RuntimeError("RESCO states are only available in benchmark_mode='resco'.")
+        selected = self.observation_mode if mode is None else mode
+        current_actions = {
+            tl_id: self._current_action_index(tl_id)
+            for tl_id in self.tl_ids
+        }
+        if selected == "wave":
+            return build_wave_states(self._resco_signals)
+        if selected == "mplight":
+            return build_mplight_states(
+                self._resco_signals,
+                current_action_by_signal=current_actions,
+            )
+        if selected == "drq":
+            return build_drq_states(
+                self._resco_signals,
+                current_action_by_signal=current_actions,
+            )
+        raise ValueError(f"Unsupported RESCO observation mode {selected!r}.")
+
+    def _build_resco_state_tensor(self, tl_id: str, mode: str) -> Tensor:
+        state = self.get_resco_states(mode)[tl_id]
+        return torch.tensor(state, dtype=torch.float32)
+
+    def _prepare_benchmark_artifacts(self) -> None:
+        if self.benchmark_mode != "resco":
+            return
+        output_dir = self.benchmark_output_dir or Path.cwd()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._benchmark_tripinfo_path = output_dir / f"tripinfo_{self._benchmark_episode_index}.xml"
+        self._benchmark_metrics_path = output_dir / f"metrics_{self._benchmark_episode_index}.csv"
+        self.adapter.set_tripinfo_output(str(self._benchmark_tripinfo_path))
+
+    def _initialize_resco_benchmark_state(self) -> None:
+        if tc is None:
+            raise RuntimeError("traci.constants is required for benchmark_mode='resco'.")
+        self._resco_map_metadata = get_resco_map_metadata(net_file=self.net_file)
+        self._resco_phase_pairs = [
+            [str(pair[0]), str(pair[1])]
+            for pair in self._resco_map_metadata["phase_pairs"]
+        ]
+        self._route_vehicle_count_cache = self._count_route_vehicles(self.route_file)
+        self._resco_signals = {}
+
+        vehicle_vars = [
+            tc.VAR_LANE_ID,
+            tc.VAR_LANEPOSITION,
+            tc.VAR_ACCELERATION,
+            tc.VAR_SPEED,
+            tc.VAR_FUELCONSUMPTION,
+            tc.VAR_WAITING_TIME,
+            tc.VAR_ALLOWED_SPEED,
+            tc.VAR_TYPE,
+            tc.VAR_TIMELOSS,
+        ]
+        for tl_id in self.tl_ids:
+            if tl_id not in self._resco_map_metadata:
+                raise KeyError(
+                    f"Traffic light {tl_id!r} is missing from vendored RESCO metadata for {self.net_file!r}."
+                )
+            if len(self._green_phases.get(tl_id, [])) != len(self._resco_phase_pairs):
+                raise ValueError(
+                    f"Traffic light {tl_id!r} exposes {len(self._green_phases.get(tl_id, []))} green phases, "
+                    f"but RESCO metadata for {self.net_file!r} expects {len(self._resco_phase_pairs)} phase-pair actions."
+                )
+            signal_meta = self._resco_map_metadata[tl_id]
+            lane_ids: list[str] = []
+            for lane_group in signal_meta["lane_sets"].values():
+                for lane_id in lane_group:
+                    if lane_id not in lane_ids:
+                        lane_ids.append(lane_id)
+
+            lane_lengths = {
+                lane_id: float(self.adapter.get_lane_length(lane_id))
+                for lane_id in lane_ids
+            }
+            lane_speed_limits = {
+                lane_id: float(self.adapter.get_lane_max_speed(lane_id))
+                for lane_id in lane_ids
+            }
+            self._resco_signals[tl_id] = RescoSignalState(
+                signal_id=tl_id,
+                signal_meta=signal_meta,
+                all_signal_meta=self._resco_map_metadata,
+                lane_lengths=lane_lengths,
+                lane_speed_limits=lane_speed_limits,
+            )
+            self.adapter.subscribe_junction_context(
+                tl_id,
+                float(self.benchmark_max_distance + 25),
+                vehicle_vars,
+            )
+
+    def _collect_resco_context_snapshots(self) -> None:
+        if tc is None:
+            return
+        for tl_id, signal in self._resco_signals.items():
+            subscription = self.adapter.get_junction_context_subscription_results(tl_id)
+            for veh_id, vehicle in subscription.items():
+                veh_lane = vehicle.get(tc.VAR_LANE_ID)
+                if veh_lane is None or veh_lane not in signal.observation.lanes:
+                    continue
+                if str(veh_id).startswith("ghost"):
+                    continue
+
+                lane_length = signal.observation.lanes[veh_lane].length
+                distance_from_light = lane_length - float(vehicle.get(tc.VAR_LANEPOSITION, 0.0))
+                if distance_from_light > self.benchmark_max_distance:
+                    continue
+
+                signal.observation.add_vehicle(
+                    make_resco_vehicle(
+                        veh_id=str(veh_id),
+                        lane_id=str(veh_lane),
+                        speed=float(vehicle.get(tc.VAR_SPEED, 0.0)),
+                        acceleration=float(vehicle.get(tc.VAR_ACCELERATION, 0.0)),
+                        position=float(distance_from_light),
+                        allowed_speed=float(vehicle.get(tc.VAR_ALLOWED_SPEED, 0.0)),
+                        fuel_consumption=float(vehicle.get(tc.VAR_FUELCONSUMPTION, 0.0)),
+                        vehicle_type=str(vehicle.get(tc.VAR_TYPE, "car")),
+                    ),
+                    step_ratio=1.0,
+                )
+
+    def _current_action_index(self, tl_id: str) -> int:
+        current_green = self._current_green.get(tl_id)
+        if current_green is None:
+            return 0
+        if current_green in self._green_phases.get(tl_id, []):
+            return self.constraints.green_phase_to_action(tl_id, current_green)
+        return 0
+
+    def _finalize_resco_observations(self) -> None:
+        for tl_id, signal in self._resco_signals.items():
+            signal.observation.finalize_step(
+                current_phase=self._current_action_index(tl_id),
+                phase_length=int(self._elapsed_green.get(tl_id, 0.0)),
+            )
+
+    def _compute_resco_rewards(self) -> Tensor:
+        if self.reward_mode == "wait":
+            rewards = compute_wait_rewards(self._resco_signals)
+        elif self.reward_mode == "pressure":
+            rewards = compute_pressure_rewards(self._resco_signals)
+        else:
+            raise ValueError(
+                f"benchmark_mode='resco' only supports reward_mode 'wait' or 'pressure'; got {self.reward_mode!r}."
+            )
+        ordered = [float(rewards[tl_id]) for tl_id in self.tl_ids]
+        return torch.tensor(ordered, dtype=torch.float32)
+
+    def _record_resco_metrics_step(self, rewards: Tensor) -> None:
+        reward_map = {
+            tl_id: float(rewards[i].item())
+            for i, tl_id in enumerate(self.tl_ids)
+        }
+        queue_lengths = {
+            tl_id: float(signal.observation.total_queued)
+            for tl_id, signal in self._resco_signals.items()
+        }
+        max_queues = {
+            tl_id: float(signal.observation.max_queue)
+            for tl_id, signal in self._resco_signals.items()
+        }
+        vehicles = {
+            tl_id: float(self._route_vehicle_count_cache or 0)
+            for tl_id in self.tl_ids
+        }
+        phase_length = {
+            tl_id: float(signal.observation.phase_length)
+            for tl_id, signal in self._resco_signals.items()
+        }
+        self._benchmark_metrics_rows.append(
+            {
+                "step": max(float(self.adapter.current_time) - 1.0, 0.0),
+                "rewards": reward_map,
+                "max_queues": max_queues,
+                "queue_lengths": queue_lengths,
+                "vehicles": vehicles,
+                "phase_length": phase_length,
+            }
+        )
+
+    def _finalize_resco_episode(self) -> None:
+        if self._benchmark_metrics_path is None or self._benchmark_tripinfo_path is None:
+            self.adapter.close()
+            self._benchmark_last_episode_raw_metrics = {"global_reward": self._benchmark_episode_global_reward}
+            return
+
+        self._write_resco_metrics_csv(self._benchmark_metrics_path)
+        self.adapter.close()
+        if (not self._benchmark_tripinfo_path.exists()) or (not self._benchmark_metrics_path.exists()):
+            self._benchmark_last_episode_raw_metrics = {
+                "duration": 0.0,
+                "waitingTime": 0.0,
+                "timeLoss": 0.0,
+                "rewards": 0.0,
+                "max_queues": 0.0,
+                "queue_lengths": 0.0,
+                "vehicles": 0.0,
+                "phase_length": 0.0,
+                "global_reward": float(self._benchmark_episode_global_reward),
+            }
+            return
+        self._benchmark_last_episode_raw_metrics = load_episode_raw_metrics(
+            tripinfo_path=self._benchmark_tripinfo_path,
+            metrics_path=self._benchmark_metrics_path,
+            global_reward=self._benchmark_episode_global_reward,
+        )
+
+    def _write_resco_metrics_csv(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(RESCO_RAW_CSV_FIELDS))
+            writer.writeheader()
+            for row in self._benchmark_metrics_rows:
+                writer.writerow({metric: str(row[metric]) for metric in RESCO_RAW_CSV_FIELDS})
+
+    @staticmethod
+    def _count_route_vehicles(route_file: str) -> int:
+        total = 0
+        for route_path in str(route_file).split(","):
+            candidate = Path(route_path.strip())
+            if not route_path.strip():
+                continue
+            try:
+                xml_root = ET.parse(candidate).getroot()
+            except Exception:
+                continue
+
+            for child in xml_root:
+                tag = child.tag.split("}")[-1]
+                if tag in {"vehicle", "trip"}:
+                    total += 1
+                    continue
+                if tag != "flow":
+                    continue
+                if "number" in child.attrib:
+                    total += int(float(child.attrib["number"]))
+                    continue
+                begin = float(child.attrib.get("begin", 0.0))
+                end = float(child.attrib.get("end", begin))
+                duration = max(end - begin, 0.0)
+                if "vehsPerHour" in child.attrib:
+                    total += int(duration * float(child.attrib["vehsPerHour"]) / 3600.0)
+                elif "probability" in child.attrib:
+                    total += int(duration * float(child.attrib["probability"]))
+        return total
 
     # ==================================================================
     # Reward
@@ -597,7 +995,11 @@ class TrafficSignalEnv:
     # Phase helpers
     # ==================================================================
     def _extract_green_phases(self, tl_id: str) -> list[int]:
-        """Return indices of phases that are 'green' (contain 'G' or 'g')."""
+        """Return RESCO-style controllable phases.
+
+        Controllable phases exclude any transitional state containing yellow
+        and any all-red/all-stop state made only of ``r``/``s``.
+        """
         logics = self.adapter.get_program_logic(tl_id)
         if not logics:
             return [0]
@@ -605,6 +1007,10 @@ class TrafficSignalEnv:
         green_indices: list[int] = []
         for i, phase in enumerate(phases):
             state = phase.state
+            if "y" in state or "Y" in state:
+                continue
+            if state.count("r") + state.count("R") + state.count("s") + state.count("S") == len(state):
+                continue
             if "G" in state or "g" in state:
                 green_indices.append(i)
         return green_indices if green_indices else [0]
@@ -638,6 +1044,8 @@ class TrafficSignalEnv:
     def _get_action_mask(self, tl_id: str) -> Tensor:
         """Return legal action mask based on observed SUMO state."""
         n_actions = len(self._green_phases[tl_id])
+        if self.benchmark_mode == "resco":
+            return torch.ones(n_actions, dtype=torch.bool)
         mask = torch.ones(n_actions, dtype=torch.bool)
 
         raw_phase = self.adapter.get_phase(tl_id)
@@ -668,7 +1076,7 @@ class TrafficSignalEnv:
         if raw_phase not in self._green_phases[tl_id]:
             return
 
-        if self._elapsed_green[tl_id] < self.constraints.min_green_duration:
+        if self.benchmark_mode != "resco" and self._elapsed_green[tl_id] < self.constraints.min_green_duration:
             return
 
         current_green = self._current_green[tl_id]

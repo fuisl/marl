@@ -118,6 +118,7 @@ def postprocess_after_training(
                 n_episodes=eval_episodes,
                 device=eval_device,
                 gui=eval_gui,
+                output_dir=str(post_dir / "eval_raw"),
             )
 
             eval_file = post_dir / "eval_metrics.json"

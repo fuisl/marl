@@ -1,4 +1,4 @@
-name: FIXED
+name: MAXWAVE
 trainer: fixed_time_baseline
 kind: baseline
 
@@ -10,4 +10,5 @@ env_overrides:
   benchmark_mode: resco
   observation_mode: graph
   reward_mode: wait
-  step_length: 5
+  step_length: 10
+  benchmark_max_distance: 50
