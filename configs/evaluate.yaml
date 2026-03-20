@@ -1,14 +1,15 @@
 defaults:
   - env: sumo
-  - scenario: grid5x5
+  - scenario: grid4x4
   - model: default
   - _self_
 
 runtime:
   checkpoint_path: null
   episodes: 5
-  device: cpu
+  device: cuda
   gui: false
+  out_dir: .
 
 hydra:
   run:

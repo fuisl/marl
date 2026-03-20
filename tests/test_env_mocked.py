@@ -1,9 +1,44 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 from tensordict import TensorDict
 
 from marl_env.sumo_env import TrafficSignalEnv
+
+
+FAKE_METADATA = {
+    "phase_pairs": [["N-N", "S-S"], ["S-S", "N-N"]],
+    "J1": {
+        "lane_sets": {
+            "N-N": ["j1_l1"],
+            "S-S": ["j1_l2"],
+        },
+        "downstream": {
+            "N": "J2",
+            "S": None,
+        },
+        "fixed_timings": [10, 10],
+        "fixed_phase_order_idx": 0,
+        "fixed_offset": 0,
+        "pair_to_act_map": {0: 0, 1: 1},
+    },
+    "J2": {
+        "lane_sets": {
+            "N-N": ["j2_l1"],
+            "S-S": ["j2_l2"],
+        },
+        "downstream": {
+            "N": None,
+            "S": "J1",
+        },
+        "fixed_timings": [10, 10],
+        "fixed_phase_order_idx": 0,
+        "fixed_offset": 0,
+        "pair_to_act_map": {0: 0, 1: 1},
+    },
+}
 
 
 class FakePhase:
@@ -20,6 +55,7 @@ class FakeTraCIAdapter:
     def __init__(self, done_after: int = 20) -> None:
         self.done_after = done_after
         self.time = 0
+        self.tripinfo_output: str | None = None
         self.tl_ids = ["J1", "J2"]
         self.lanes = {
             "J1": ["j1_l1", "j1_l2"],
@@ -29,6 +65,7 @@ class FakeTraCIAdapter:
         self.phase_history = {tl_id: [0] for tl_id in self.tl_ids}
         self._phase_durations = {0: 999, 1: 1, 2: 1, 3: 999, 4: 1, 5: 1}
         self._remaining = {tl_id: self._phase_durations[0] for tl_id in self.tl_ids}
+        self._context: dict[str, dict[str, dict[int, object]]] = {}
 
     def start(self) -> None:
         self.time = 0
@@ -38,6 +75,9 @@ class FakeTraCIAdapter:
 
     def close(self, wait: bool = False) -> None:
         _ = wait
+
+    def set_tripinfo_output(self, path: str | None) -> None:
+        self.tripinfo_output = path
 
     def simulation_step(self) -> None:
         self.time += 1
@@ -56,12 +96,12 @@ class FakeTraCIAdapter:
         return 1 if self.time < self.done_after else 0
 
     @property
-    def current_time(self):
+    def current_time(self) -> int:
         return self.time
 
     @property
-    def end_time(self):
-        return 999999  # or a configured horizon for the fake
+    def end_time(self) -> int:
+        return 999999
 
     def get_traffic_light_ids(self) -> list[str]:
         return self.tl_ids
@@ -92,90 +132,70 @@ class FakeTraCIAdapter:
     def get_controlled_lanes(self, tl_id: str) -> list[str]:
         return self.lanes[tl_id]
 
-    def get_controlled_links(self, tl_id: str) -> list[list[tuple[str, str, str]]]:
-        # Mimic TraCI shape: list over signal indices, each containing
-        # (in_lane, out_lane, via_lane) tuples.
-        lanes = self.lanes[tl_id]
-        return [
-            [(lanes[0], lanes[0], "")],
-            [(lanes[1], lanes[1], "")],
-        ]
-
-    @staticmethod
-    def get_arrived_number() -> int:
-        return 0
-
-    @staticmethod
-    def get_departed_number() -> int:
-        return 0
-
-    @staticmethod
-    def get_teleported_number() -> int:
-        return 0
-
-    @staticmethod
-    def get_arrived_ids() -> list[str]:
-        return []
-
-    @staticmethod
-    def get_departed_ids() -> list[str]:
-        return []
-
-    @staticmethod
-    def get_lane_vehicle_count(lane_id: str) -> int:
-        return 1 if lane_id.endswith("1") else 2
-
-    @staticmethod
-    def get_lane_halting_number(lane_id: str) -> int:
-        return 1 if lane_id.endswith("1") else 2
-
-    @staticmethod
-    def get_lane_waiting_time(lane_id: str) -> float:
-        return 2.0 if lane_id.endswith("1") else 3.0
-
-    @staticmethod
-    def get_lane_occupancy(lane_id: str) -> float:
-        return 0.1 if lane_id.endswith("1") else 0.2
-
-    @staticmethod
-    def get_lane_mean_speed(lane_id: str) -> float:
-        return 5.0 if lane_id.endswith("1") else 6.0
-
-    @staticmethod
-    def get_vehicle_benchmark_metrics(vid: str) -> tuple[float, float]:
-        _ = vid
-        return (0.0, 0.0)
-
-
-class FakeTraCIAdapterVehicleMetrics(FakeTraCIAdapter):
-    def __init__(self, done_after: int = 3) -> None:
-        super().__init__(done_after=done_after)
-        self._active_vehicle_id = "veh0"
-
-    def simulation_step(self) -> None:
-        self.time += 1
-
-    def get_departed_ids(self) -> list[str]:
-        return [self._active_vehicle_id] if self.time == 1 else []
-
-    def get_arrived_ids(self) -> list[str]:
-        return [self._active_vehicle_id] if self.time == 2 else []
-
     def get_arrived_number(self) -> int:
-        return 1 if self.time == 2 else 0
+        return 0
 
     def get_departed_number(self) -> int:
-        return 1 if self.time == 1 else 0
+        return 0
+
+    def get_teleported_number(self) -> int:
+        return 0
+
+    def subscribe_junction_context(
+        self,
+        junction_id: str,
+        radius: float,
+        variables: list[int],
+    ) -> None:
+        _ = radius
+        self._context[junction_id] = self._build_context_results(junction_id, variables)
+
+    def get_junction_context_subscription_results(self, junction_id: str) -> dict[str, dict[int, object]]:
+        return dict(self._context.get(junction_id, {}))
+
+    def _build_context_results(
+        self,
+        junction_id: str,
+        variables: list[int],
+    ) -> dict[str, dict[int, object]]:
+        values_by_lane = {
+            "J1": [("veh_j1_a", "j1_l1", 0.0), ("veh_j1_b", "j1_l2", 5.0)],
+            "J2": [("veh_j2_a", "j2_l1", 0.0), ("veh_j2_b", "j2_l2", 5.0)],
+        }
+        results: dict[str, dict[int, object]] = {}
+        for veh_id, lane_id, speed in values_by_lane[junction_id]:
+            entry: dict[int, object] = {}
+            for variable in variables:
+                if variable == 81:  # lane id placeholder when patched tc is missing
+                    entry[variable] = lane_id
+                elif variable == 86:  # lane position
+                    entry[variable] = 90.0
+                elif variable == 114:  # acceleration
+                    entry[variable] = 0.0
+                elif variable == 64:  # speed
+                    entry[variable] = speed
+                elif variable == 101:  # fuel
+                    entry[variable] = 0.0
+                elif variable == 122:  # waiting
+                    entry[variable] = 0.0
+                elif variable == 177:  # allowed speed
+                    entry[variable] = 10.0
+                elif variable == 79:  # type
+                    entry[variable] = "car"
+                elif variable == 140:  # time loss
+                    entry[variable] = 0.0
+            results[veh_id] = entry
+        return results
 
     @staticmethod
-    def subscribe_vehicle(vid: str) -> None:
-        _ = vid
+    def get_lane_length(lane_id: str) -> float:
+        _ = lane_id
+        return 100.0
 
-    def get_vehicle_benchmark_metrics(self, vid: str) -> tuple[float, float]:
-        if self.time < 2 and vid == self._active_vehicle_id:
-            return (12.0, 34.0)
-        # Mimic libsumo behavior where vehicle metrics are unavailable at arrival.
-        return (0.0, 0.0)
+    @staticmethod
+    def get_lane_max_speed(lane_id: str) -> float:
+        _ = lane_id
+        return 10.0
 
 
 class FakeGraphBuilder:
@@ -184,7 +204,7 @@ class FakeGraphBuilder:
         net_file: str,
         tl_ids: list[str],
         *,
-        mode: str = "original",
+        mode: str = "all_intersections",
     ) -> None:
         self.net_file = net_file
         self.tl_ids = tl_ids
@@ -192,6 +212,8 @@ class FakeGraphBuilder:
         self.node_ids = list(tl_ids)
         self.agent_node_indices = torch.tensor([[0], [1]], dtype=torch.long)
         self.agent_node_mask = torch.tensor([[True], [True]], dtype=torch.bool)
+        self.node_positions = torch.zeros((2, 2), dtype=torch.float32)
+        self.net = SimpleNamespace()
 
     def build(self) -> tuple[torch.Tensor, torch.Tensor]:
         edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
@@ -201,6 +223,25 @@ class FakeGraphBuilder:
     @property
     def attached_rl_ids_by_node(self) -> list[tuple[str, ...]]:
         return [(tl_id,) for tl_id in self.tl_ids]
+
+
+def _patch_env_dependencies(monkeypatch: object) -> None:
+    import marl_env.sumo_env as sumo_env_mod
+
+    fake_tc = SimpleNamespace(
+        VAR_LANE_ID=81,
+        VAR_LANEPOSITION=86,
+        VAR_ACCELERATION=114,
+        VAR_SPEED=64,
+        VAR_FUELCONSUMPTION=101,
+        VAR_WAITING_TIME=122,
+        VAR_ALLOWED_SPEED=177,
+        VAR_TYPE=79,
+        VAR_TIMELOSS=140,
+    )
+    monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
+    monkeypatch.setattr(sumo_env_mod, "get_resco_map_metadata", lambda **_: FAKE_METADATA)
+    monkeypatch.setattr(sumo_env_mod, "tc", fake_tc)
 
 
 def _sample_valid_actions(mask: torch.Tensor) -> torch.Tensor:
@@ -213,9 +254,7 @@ def _sample_valid_actions(mask: torch.Tensor) -> torch.Tensor:
 
 
 def _make_env(monkeypatch: object, done_after: int = 20) -> TrafficSignalEnv:
-    import marl_env.sumo_env as sumo_env_mod
-
-    monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
+    _patch_env_dependencies(monkeypatch)
     env = TrafficSignalEnv(
         net_file="dummy.net.xml",
         route_file="dummy.rou.xml",
@@ -223,7 +262,6 @@ def _make_env(monkeypatch: object, done_after: int = 20) -> TrafficSignalEnv:
         min_green_duration=0,
     )
     env.adapter = FakeTraCIAdapter(done_after=done_after)
-    env.graph_builder = None
     return env
 
 
@@ -234,56 +272,56 @@ def test_env_reset_and_step_shapes_and_finite(monkeypatch: object) -> None:
 
     obs = td["agents", "observation"]
     mask = td["agents", "action_mask"]
-    edge_index = td["edge_index"]
-    graph_obs = td["graph_observation"]
+    graph_metadata = env.get_graph_metadata()
 
     assert obs.ndim == 2
     assert mask.ndim == 2
     assert obs.shape[0] == env.n_agents
-    assert mask.shape[0] == env.n_agents
-    assert edge_index.shape[0] == 2
-    assert graph_obs.shape == obs.shape
-    assert td["agent_node_indices"].shape == (env.n_agents, 1)
-    assert td["agent_node_mask"].shape == (env.n_agents, 1)
+    assert mask.shape == (env.n_agents, env.num_actions)
+    assert obs.shape[1] == env.observation_dim
+    assert graph_metadata.edge_index.shape == (2, 2)
+    assert graph_metadata.agent_node_indices.shape == (env.n_agents, 1)
+    assert graph_metadata.agent_node_mask.shape == (env.n_agents, 1)
     assert torch.all(mask.any(dim=1))
 
     obs_shape = obs.shape
     mask_shape = mask.shape
-    edge_index_snapshot = edge_index.clone()
 
     actions = _sample_valid_actions(mask)
     td2 = env.step(actions)
 
     assert td2["agents", "observation"].shape == obs_shape
     assert td2["agents", "action_mask"].shape == mask_shape
-    assert torch.equal(td2["edge_index"], edge_index_snapshot)
     assert torch.isfinite(td2["agents", "observation"]).all()
     assert torch.isfinite(td2["agents", "reward"]).all()
     assert torch.all(td2["agents", "action_mask"].any(dim=1))
 
 
-def test_env_done_eventually_true(monkeypatch: object) -> None:
-    env = _make_env(monkeypatch, done_after=6)
+def test_env_done_eventually_true_and_metrics_are_resco_style(monkeypatch: object) -> None:
+    env = _make_env(monkeypatch, done_after=4)
     td = env.reset()
 
     done = bool(td.get("done", torch.tensor([False])).item())
-    for _ in range(20):
+    for _ in range(10):
         mask = td["agents", "action_mask"]
-        assert torch.all(mask.any(dim=1))
         actions = _sample_valid_actions(mask)
         td = env.step(actions)
-        assert torch.isfinite(td["agents", "reward"]).all()
         done = bool(td["done"].item())
         if done:
             break
 
     assert done
+    metrics = env.get_episode_metrics()
+    assert "Avg Duration" not in metrics
+    assert "duration" in metrics
+    assert "waitingTime" in metrics
+    assert "timeLoss" in metrics
+    assert "global_reward" in metrics
 
 
 def test_transition_sequence_and_elapsed_reset(monkeypatch: object) -> None:
     env = _make_env(monkeypatch, done_after=50)
-    td = env.reset()
-    _ = td
+    env.reset()
 
     assert env.num_actions >= 2
     assert env._current_green["J1"] == 0
@@ -295,38 +333,9 @@ def test_transition_sequence_and_elapsed_reset(monkeypatch: object) -> None:
         elapsed_trace.append(env._elapsed_green["J1"])
 
     history = env.adapter.phase_history["J1"]
-    assert 1 in history  # yellow phase
-    assert 2 in history  # all-red phase
-    assert history[-1] == 3  # destination green
-
+    assert 1 in history
+    assert 2 in history
+    assert history[-1] == 3
     assert env._current_green["J1"] == 3
-    # Under SUMO-managed progression, elapsed green resets at arrival to
-    # destination green and may increase on subsequent steps.
     assert 0.0 in elapsed_trace
     assert not env.constraints.in_transition("J1")
-
-
-def test_episode_kpis_use_cached_vehicle_metrics_when_arrival_lookup_empty(monkeypatch: object) -> None:
-    import marl_env.sumo_env as sumo_env_mod
-
-    monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
-    env = TrafficSignalEnv(
-        net_file="dummy.net.xml",
-        route_file="dummy.rou.xml",
-        delta_t=1,
-        min_green_duration=0,
-    )
-    env.adapter = FakeTraCIAdapterVehicleMetrics(done_after=3)
-    env.graph_builder = None
-
-    td = env.reset()
-    for _ in range(3):
-        actions = _sample_valid_actions(td["agents", "action_mask"])
-        td = env.step(actions)
-        if bool(td["done"].item()):
-            break
-
-    kpis = env.get_episode_kpis()
-    assert kpis["arrived_vehicles"] >= 1.0
-    assert kpis["avg_wait_s"] > 0.0
-    assert kpis["avg_delay_s"] > 0.0

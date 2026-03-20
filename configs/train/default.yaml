@@ -55,13 +55,5 @@ postprocess:
   on_interrupt: true
 
   run_evaluation: true
-  eval_episodes: 5
-  eval_gui: false
 
   run_visualization: true
-  visualization_out_dir: null
-  visualization_device: cpu
-  visualization_num_snapshots: 5
-  visualization_max_hops: null
-  visualization_curve_num_samples: null
-  visualization_map_num_samples: null

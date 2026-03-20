@@ -49,16 +49,25 @@ def _handle_signal(signum: int, _frame: Any) -> None:
 
 
 def _as_plain(cfg: Any) -> Any:
+    if isinstance(cfg, dict):
+        return dict(cfg)
+    if cfg is None:
+        return None
     return OmegaConf.to_container(cfg, resolve=True)
 
 
 def _merge_env_cfg(cfg: DictConfig) -> dict[str, Any]:
     env_common = _as_plain(cfg.env.common)
     scenario_params = _as_plain(cfg.scenario.env_params)
+    algo_env_overrides = _as_plain(cfg.algo.get("env_overrides", {}))
     if not isinstance(env_common, dict) or not isinstance(scenario_params, dict):
         raise ValueError("Invalid env/scenario config. Expected mapping objects.")
+    if algo_env_overrides is None:
+        algo_env_overrides = {}
+    if not isinstance(algo_env_overrides, dict):
+        raise ValueError("Invalid algo.env_overrides config. Expected a mapping object.")
 
-    merged = {**env_common, **scenario_params}
+    merged = {**env_common, **scenario_params, **algo_env_overrides}
     if cfg.runtime.gui is not None:
         merged["gui"] = bool(cfg.runtime.gui)
     return merged
@@ -113,6 +122,7 @@ def main(cfg: DictConfig) -> None:
     if trainer == "fixed_time_baseline":
         run_baseline(
             env_cfg,
+            policy_name=str(cfg.algo.name),
             out_dir=str(cfg.runtime.out_dir),
             wandb_cfg=_as_plain(cfg.logger.wandb),
             run_name=str(cfg.run_name),

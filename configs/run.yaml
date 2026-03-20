@@ -1,6 +1,6 @@
 defaults:
   - env: sumo
-  - scenario: grid5x5
+  - scenario: grid4x4
   - algo: discrete_sac
   - model: default
   - train: default

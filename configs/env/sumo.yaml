@@ -1,20 +1,17 @@
 name: sumo_traffic
 family: sumo
 action_space: discrete
-obs_space: graph
+obs_space: snapshot
 
 common:
-  delta_t: 5
+  delta_t: 10
+  step_length: 10
   sumo_binary: sumo
   gui: false
   additional_files: null
-  graph_builder_mode: all_intersections
   timeloss_subscription_policy: strict
-
-  reward_mode: pressure_queue
-  reward_weights:
-    pressure: 1.0
-    queue: 0.1
+  max_distance: 200
+  reward_name: wait
 
   yellow_duration: 3
   all_red_duration: 2

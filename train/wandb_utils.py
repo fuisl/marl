@@ -1,10 +1,7 @@
 from __future__ import annotations
 
-import atexit
 from collections.abc import Mapping
 from pathlib import Path
-import signal
-import sys
 from typing import Any
 
 try:
@@ -51,12 +48,22 @@ class SafeWandbRun:
             config=run_config,
             dir=str(out_dir),
             tags=tags,
+            settings=_wandb.Settings(start_method="thread"),
         )
         _wandb.define_metric("Episode")
-        _wandb.define_metric("Learning/*", step_metric="Episode")
-        _wandb.define_metric("Traffic/*", step_metric="Episode")
-        _wandb.define_metric("RESCO/*", step_metric="Episode")
-        _wandb.define_metric("Debug/*", step_metric="Episode")
+        for metric_name in (
+            "Episode Length",
+            "Total Transitions",
+            "Elapsed Time (s)",
+            "Avg Duration",
+            "Avg Waiting Time",
+            "Avg Time Loss",
+            "Avg Queue Length",
+            "Avg Reward",
+            "Global Reward",
+            "Best Global Reward",
+        ):
+            _wandb.define_metric(metric_name, step_metric="Episode")
 
         _wandb.config.update({"run_metadata": dict(run_metadata)}, allow_val_change=True)
         run_obj = _wandb.run
@@ -64,18 +71,6 @@ class SafeWandbRun:
             for key, value in run_metadata.items():
                 run_obj.summary[str(key)] = value
             run_obj.summary["run_name"] = run_name
-
-        def _wandb_atexit() -> None:
-            if _wandb is not None and _wandb.run is not None:
-                self.finish(exit_code=1)
-
-        atexit.register(_wandb_atexit)
-
-        # Ensure atexit runs when the process gets SIGTERM.
-        def _sigterm_to_exit(signum: int, frame: object) -> None:  # noqa: ANN001
-            sys.exit(1)
-
-        signal.signal(signal.SIGTERM, _sigterm_to_exit)
 
     def log(self, payload: Mapping[str, Any]) -> None:
         if not self.active:

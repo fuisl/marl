@@ -4,4 +4,4 @@ kind: off_policy
 
 supports:
   action_space: [discrete]
-  obs_space: [graph, vector]
+  obs_space: [snapshot]

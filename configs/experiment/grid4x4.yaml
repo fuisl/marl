@@ -1,0 +1,7 @@
+defaults:
+  - override /algo: discrete_sac
+  - override /scenario: grid4x4
+  - override /train: default
+  - _self_
+
+tags: [baseline, grid4x4]

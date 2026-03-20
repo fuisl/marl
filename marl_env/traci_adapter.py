@@ -18,6 +18,11 @@ except ImportError as exc:  # pragma: no cover - environment dependent
         "libsumo is required. Install SUMO Python bindings in the active environment."
     ) from exc
 
+try:  # pragma: no cover - optional import path depends on SUMO packaging
+    import traci.constants as tc  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - fallback for stripped installs
+    tc = None  # type: ignore[assignment]
+
 
 # Stable TraCI/libsumo vehicle variable IDs used for per-vehicle episode stats.
 _VAR_ACCUM_WAITING: int = 0x87  # vehicle.getAccumulatedWaitingTime() == tc.VAR_ACCUMULATED_WAITING_TIME
@@ -47,6 +52,7 @@ class TraCIAdapter:
         extra_args: list[str] | None = None,
         label: str = "default",
         timeloss_subscription_policy: str = "strict",
+        tripinfo_output: str | None = None,
     ) -> None:
         self.net_file = net_file
         self.route_file = route_file
@@ -62,9 +68,12 @@ class TraCIAdapter:
         self.timeloss_subscription_policy = timeloss_subscription_policy
         self._vehicle_timeloss_sub_supported: bool | None = None
 
-        binary = "sumo-gui" if gui else sumo_binary
+        self._binary = "sumo-gui" if gui else sumo_binary
+        self._additional_files = additional_files
+        self._extra_args = extra_args or []
+        self.tripinfo_output = tripinfo_output
         self._sumo_cmd: list[str] = [
-            binary,
+            self._binary,
             "-n", net_file,
             "-r", route_file,
             "--waiting-time-memory", "1000",
@@ -74,10 +83,6 @@ class TraCIAdapter:
             "--no-step-log", "True",
             "--no-warnings", "True",
         ]
-        if additional_files:
-            self._sumo_cmd += ["-a", ",".join(additional_files)]
-        if extra_args:
-            self._sumo_cmd += extra_args
 
         self._conn: Any | None = None
         self._sumo_version: str | None = None
@@ -90,6 +95,7 @@ class TraCIAdapter:
             raise RuntimeError("TraCIAdapter.start() called while a connection is already open.")
 
         # libsumo uses the module itself as the API surface.
+        self._sumo_cmd = self._build_sumo_cmd()
         traci.start(self._sumo_cmd)
         self._conn = traci
         self._validate_runtime_version()
@@ -144,6 +150,27 @@ class TraCIAdapter:
 
     def get_red_yellow_green_state(self, tl_id: str) -> str:
         return self._require_conn().trafficlight.getRedYellowGreenState(tl_id)
+
+    def subscribe_junction_context(
+        self,
+        junction_id: str,
+        radius: float,
+        variables: list[int],
+    ) -> None:
+        if tc is None:
+            raise RuntimeError("traci.constants is required for RESCO context subscriptions.")
+        self._require_conn().junction.subscribeContext(
+            junction_id,
+            tc.CMD_GET_VEHICLE_VARIABLE,
+            radius,
+            variables,
+        )
+
+    def get_junction_context_subscription_results(self, junction_id: str) -> dict[str, dict[int, Any]]:
+        results = self._require_conn().junction.getContextSubscriptionResults(junction_id)
+        if results is None:
+            return {}
+        return dict(results)
 
     # ------------------------------------------------------------------
     # Lane accessors
@@ -262,6 +289,9 @@ class TraCIAdapter:
         """
         return dict(self._require_conn().vehicle.getSubscriptionResults(vid) or {})
 
+    def set_tripinfo_output(self, path: str | None) -> None:
+        self.tripinfo_output = path
+
     # ------------------------------------------------------------------
     # Internal helper
     # ------------------------------------------------------------------
@@ -301,3 +331,33 @@ class TraCIAdapter:
         if match is None:
             return None
         return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+    def _build_sumo_cmd(self) -> list[str]:
+        cmd = [
+            self._binary,
+            "-n", self.net_file,
+            "-r", self.route_file,
+            "--waiting-time-memory", "1000",
+            "--time-to-teleport", "-1",
+            "-b", str(self.begin_time),
+            "-e", str(self.end_time),
+            "--no-step-log", "True",
+            "--no-warnings", "True",
+        ]
+        if self._additional_files:
+            cmd += ["-a", ",".join(self._additional_files)]
+        cmd += [
+            "--random", "True",
+            "--extrapolate-departpos", "True",
+        ]
+        if self.tripinfo_output:
+            cmd += [
+                "--tripinfo-output", self.tripinfo_output,
+                "--tripinfo-output.write-unfinished", "True",
+                "--tripinfo-output.write-undeparted", "True",
+                "--eager-insert", "True",
+            ]
+
+        if self._extra_args:
+            cmd += list(self._extra_args)
+        return cmd

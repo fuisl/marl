@@ -1,0 +1,11 @@
+name: STOCHASTIC
+trainer: fixed_time_baseline
+kind: baseline
+
+supports:
+  action_space: [discrete]
+  obs_space: [snapshot]
+
+env_overrides:
+  step_length: 5
+  max_distance: 200

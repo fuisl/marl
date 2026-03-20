@@ -22,6 +22,7 @@ from torch_geometric.data import Data
 from torch_geometric.utils import get_num_hops, k_hop_subgraph
 from torch_geometric.utils.influence import k_hop_subsets_exact
 
+from marl_env.observation_adapter import GraphMetadata, ObservationAdapter
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 
@@ -120,9 +121,16 @@ def resolve_max_hops(model: nn.Module, configured_max_hops: int | None) -> int:
     return int(get_num_hops(model))
 
 
-def resolve_curve_num_samples(num_nodes: int, configured_num_samples: int | None) -> int:
+def resolve_curve_num_samples(
+    num_nodes: int,
+    configured_num_samples: int | None,
+    *,
+    use_all_nodes_when_null: bool = False,
+) -> int:
     if configured_num_samples is not None:
         return min(int(configured_num_samples), num_nodes)
+    if use_all_nodes_when_null:
+        return num_nodes
     if num_nodes <= 256:
         return num_nodes
     return min(128, num_nodes)
@@ -155,11 +163,19 @@ def select_sampled_nodes(
     num_nodes: int,
     num_samples: int,
     *,
-    seed: int = 0,
+    seed: int | None = 0,
+    sort_nodes: bool = True,
 ) -> list[int]:
-    generator = torch.Generator().manual_seed(seed)
-    sampled = torch.randperm(num_nodes, generator=generator)[:num_samples]
-    return sorted(int(i) for i in sampled.tolist())
+    if seed is None:
+        sampled = torch.randperm(num_nodes)[:num_samples]
+    else:
+        generator = torch.Generator().manual_seed(seed)
+        sampled = torch.randperm(num_nodes, generator=generator)[:num_samples]
+
+    sampled_list = [int(i) for i in sampled.tolist()]
+    if sort_nodes:
+        return sorted(sampled_list)
+    return sampled_list
 
 
 def receptive_field_breadth(influence_per_hop: Tensor) -> float:
@@ -271,12 +287,32 @@ def _total_influence_with_edge_attr(
     max_hops: int,
     num_samples: int,
     device: torch.device | str,
-    seed: int = 0,
+    seed: int | None = 0,
+    sampled_node_mode: str = "seeded_sorted",
     normalize: bool = True,
     average: bool = True,
     vectorize: bool = True,
 ) -> tuple[Tensor, float]:
-    sampled_nodes = select_sampled_nodes(int(data.num_nodes), num_samples, seed=seed)
+    if sampled_node_mode == "seeded_sorted":
+        sampled_nodes = select_sampled_nodes(
+            int(data.num_nodes),
+            num_samples,
+            seed=seed,
+            sort_nodes=True,
+        )
+    elif sampled_node_mode == "official_random":
+        sampled_nodes = select_sampled_nodes(
+            int(data.num_nodes),
+            num_samples,
+            seed=seed,
+            sort_nodes=False,
+        )
+    else:
+        raise ValueError(
+            f"Invalid sampled_node_mode={sampled_node_mode!r}. "
+            "Use one of: seeded_sorted, official_random."
+        )
+
     influence_rows = [
         _jacobian_l1_agg_per_hop_safe(
             model,
@@ -307,20 +343,27 @@ def count_episode_steps(
     env: TrafficSignalEnv,
     agent: MARLDiscreteSAC,
     device: torch.device | str,
+    adapter: ObservationAdapter,
+    graph_metadata: GraphMetadata,
+    feature_mode: str,
 ) -> int:
     """Count deterministic decision steps in one episode."""
     td = env.reset().to(device)
     steps = 0
 
     while True:
+        graph_obs = adapter.graph_features(
+            td["agents", "observation"],
+            feature_mode=feature_mode,
+        )
         actions, _ = agent.select_action(
-            td.get("graph_observation", td["agents", "observation"]),
-            td["edge_index"],
-            td.get("edge_attr", None),
+            graph_obs,
+            graph_metadata.edge_index.to(device),
+            None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.to(device),
             td["agents", "action_mask"],
             deterministic=True,
-            agent_node_indices=td["agent_node_indices"],
-            agent_node_mask=td["agent_node_mask"],
+            agent_node_indices=graph_metadata.agent_node_indices.to(device),
+            agent_node_mask=graph_metadata.agent_node_mask.to(device),
         )
 
         next_td = env.step(actions.cpu()).to(device)
@@ -338,6 +381,9 @@ def collect_snapshot_graphs(
     agent: MARLDiscreteSAC,
     device: torch.device | str,
     snapshot_steps: list[int],
+    adapter: ObservationAdapter,
+    graph_metadata: GraphMetadata,
+    feature_mode: str,
 ) -> list[SnapshotGraph]:
     """Collect graph snapshots at selected decision steps."""
     wanted = set(snapshot_steps)
@@ -347,27 +393,34 @@ def collect_snapshot_graphs(
 
     while True:
         if step_index in wanted:
-            graph_obs = td.get("graph_observation", td["agents", "observation"])
+            graph_obs = adapter.graph_features(
+                td["agents", "observation"],
+                feature_mode=feature_mode,
+            )
             snapshots.append(
                 SnapshotGraph(
                     step_index=step_index,
                     data=Data(
                         x=graph_obs.detach().cpu(),
-                        edge_index=td["edge_index"].detach().cpu(),
-                        edge_attr=_extract_edge_attr(td),
+                        edge_index=graph_metadata.edge_index.detach().cpu(),
+                        edge_attr=None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.detach().cpu(),
                         num_nodes=int(graph_obs.shape[0]),
                     ),
                 )
             )
 
+        graph_obs = adapter.graph_features(
+            td["agents", "observation"],
+            feature_mode=feature_mode,
+        )
         actions, _ = agent.select_action(
-            td.get("graph_observation", td["agents", "observation"]),
-            td["edge_index"],
-            td.get("edge_attr", None),
+            graph_obs,
+            graph_metadata.edge_index.to(device),
+            None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.to(device),
             td["agents", "action_mask"],
             deterministic=True,
-            agent_node_indices=td["agent_node_indices"],
-            agent_node_mask=td["agent_node_mask"],
+            agent_node_indices=graph_metadata.agent_node_indices.to(device),
+            agent_node_mask=graph_metadata.agent_node_mask.to(device),
         )
 
         next_td = env.step(actions.cpu()).to(device)
@@ -387,11 +440,11 @@ def collect_snapshot_graphs(
 def load_agent_for_visualization(
     checkpoint_path: Path,
     model_cfg: dict[str, Any],
-    td0: TensorDict,
+    graph_observation: Tensor,
     num_actions: int,
     device: torch.device,
 ) -> MARLDiscreteSAC:
-    obs_dim = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
+    obs_dim = int(graph_observation.shape[-1])
 
     agent = MARLDiscreteSAC(
         obs_dim=obs_dim,
@@ -601,25 +654,44 @@ def plot_influence_curve(
     avg_curve: Tensor,
     snapshot_curves: list[Tensor],
     avg_receptive_field: float,
+    *,
+    log_y: bool = False,
 ) -> None:
     hops = list(range(avg_curve.numel()))
     stacked = torch.stack(snapshot_curves)
     std_curve = stacked.std(dim=0) if len(snapshot_curves) > 1 else torch.zeros_like(avg_curve)
 
+    if log_y:
+        eps = 1e-12
+        avg_curve_plot = torch.clamp(avg_curve, min=eps)
+        std_curve_plot = std_curve
+    else:
+        avg_curve_plot = avg_curve
+        std_curve_plot = std_curve
+
     fig, ax = plt.subplots(figsize=(8, 5))
     for curve in snapshot_curves:
-        ax.plot(hops, curve.tolist(), color="#C9CED4", linewidth=1.0, alpha=0.9)
+        curve_plot = torch.clamp(curve, min=1e-12) if log_y else curve
+        ax.plot(hops, curve_plot.tolist(), color="#C9CED4", linewidth=1.0, alpha=0.9)
+
+    lower = avg_curve_plot - std_curve_plot
+    upper = avg_curve_plot + std_curve_plot
+    if log_y:
+        lower = torch.clamp(lower, min=1e-12)
+        upper = torch.clamp(upper, min=1e-12)
 
     ax.fill_between(
         hops,
-        (avg_curve - std_curve).tolist(),
-        (avg_curve + std_curve).tolist(),
+        lower.tolist(),
+        upper.tolist(),
         color="#6BAED6",
         alpha=0.2,
     )
-    ax.plot(hops, avg_curve.tolist(), color="#0B5394", linewidth=2.5, marker="o")
+    ax.plot(hops, avg_curve_plot.tolist(), color="#0B5394", linewidth=2.5, marker="o")
+    if log_y:
+        ax.set_yscale("log")
     ax.set_xlabel("Hop distance")
-    ax.set_ylabel("Normalized total influence")
+    ax.set_ylabel("Normalized total influence" if not log_y else "Normalized total influence (log scale)")
     ax.set_title(f"Total Influence by Hop (Average R = {avg_receptive_field:.3f})")
     ax.grid(alpha=0.25, linewidth=0.5)
     fig.tight_layout()
@@ -954,11 +1026,18 @@ def compute_average_total_influence(
     max_hops: int,
     num_samples: int,
     device: torch.device | str,
+    sampling_mode: str,
+    sampling_seed: int | None,
 ) -> tuple[Tensor, float, list[Tensor], list[float]]:
     curves: list[Tensor] = []
     breadths: list[float] = []
 
     for snapshot in snapshots:
+        if sampling_seed is None:
+            run_seed = snapshot.step_index if sampling_mode == "seeded_sorted" else None
+        else:
+            run_seed = int(sampling_seed) + int(snapshot.step_index)
+
         try:
             curve, breadth = _total_influence_with_edge_attr(
                 model,
@@ -968,7 +1047,8 @@ def compute_average_total_influence(
                 normalize=True,
                 average=True,
                 device=device,
-                seed=snapshot.step_index,
+                seed=run_seed,
+                sampled_node_mode=sampling_mode,
                 vectorize=True,
             )
         except Exception as exc:  # pragma: no cover - exercised in integration
@@ -1152,6 +1232,10 @@ def run_visualization(
     num_snapshots: int = 5,
     max_hops: int | None = None,
     curve_num_samples: int | None = None,
+    curve_use_all_nodes_when_null: bool = False,
+    curve_sampling_mode: str = "seeded_sorted",
+    curve_sampling_seed: int | None = None,
+    curve_log_y: bool = False,
     map_num_samples: int | None = None,
     show_blue_edges_influence_map: bool = True,
     focal_node_index: int | None = None,
@@ -1173,6 +1257,18 @@ def run_visualization(
     env = TrafficSignalEnv(**env_cfg)
     try:
         td0 = env.reset()
+        graph_metadata = env.get_graph_metadata()
+        feature_mode = str(dict(model_cfg.get("observation_adapter", {})).get("feature_mode", "wave"))
+        adapter = ObservationAdapter(
+            signal_specs=env.get_signal_specs(),
+            tl_ids=env.tl_ids,
+            layout=env.observation_layout,
+            graph_metadata=graph_metadata,
+        )
+        graph_obs0 = adapter.graph_features(
+            td0["agents", "observation"],
+            feature_mode=feature_mode,
+        )
         node_ids = list(env.graph_builder.node_ids)  # type: ignore[union-attr]
         attached_rl_ids_by_node = list(env.graph_builder.attached_rl_ids_by_node)  # type: ignore[union-attr]
         node_labels = [
@@ -1186,14 +1282,14 @@ def run_visualization(
         node_is_signal = [len(attached_rl_ids) > 0 for attached_rl_ids in attached_rl_ids_by_node]
         positions = env.graph_builder.node_positions.detach().cpu()  # type: ignore[union-attr]
         road_segments = extract_road_segments(env.graph_builder.net)  # type: ignore[union-attr]
-        edge_index = td0["edge_index"].detach().cpu()
-        edge_attr = _extract_edge_attr(td0)
-        graph_builder_mode = env.graph_builder.mode  # type: ignore[union-attr]
+        edge_index = graph_metadata.edge_index.detach().cpu()
+        edge_attr = None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.detach().cpu()
+        topology_method = "all_intersections"
 
         agent = load_agent_for_visualization(
             checkpoint_path=checkpoint_path,
             model_cfg=model_cfg,
-            td0=td0,
+            graph_observation=graph_obs0,
             num_actions=env.num_actions,
             device=device_obj,
         )
@@ -1201,14 +1297,33 @@ def run_visualization(
         influence_model.eval()
 
         resolved_max_hops = resolve_max_hops(influence_model, max_hops)
-        episode_steps = count_episode_steps(env, agent, device_obj)
+        episode_steps = count_episode_steps(
+            env,
+            agent,
+            device_obj,
+            adapter,
+            graph_metadata,
+            feature_mode,
+        )
         snapshot_steps = evenly_spaced_indices(episode_steps, num_snapshots)
-        snapshots = collect_snapshot_graphs(env, agent, device_obj, snapshot_steps)
+        snapshots = collect_snapshot_graphs(
+            env,
+            agent,
+            device_obj,
+            snapshot_steps,
+            adapter,
+            graph_metadata,
+            feature_mode,
+        )
     finally:
         env.close()
 
     num_nodes = len(node_ids)
-    resolved_curve_samples = resolve_curve_num_samples(num_nodes, curve_num_samples)
+    resolved_curve_samples = resolve_curve_num_samples(
+        num_nodes,
+        curve_num_samples,
+        use_all_nodes_when_null=curve_use_all_nodes_when_null,
+    )
     resolved_map_samples = resolve_map_num_samples(num_nodes, map_num_samples)
 
     avg_curve, avg_breadth, snapshot_curves, snapshot_breadths = compute_average_total_influence(
@@ -1217,6 +1332,8 @@ def run_visualization(
         max_hops=resolved_max_hops,
         num_samples=resolved_curve_samples,
         device=device_obj,
+        sampling_mode=curve_sampling_mode,
+        sampling_seed=curve_sampling_seed,
     )
 
     representative_snapshot = snapshots[len(snapshots) // 2]
@@ -1258,7 +1375,7 @@ def run_visualization(
         edge_index,
         node_labels,
         node_is_signal,
-        method_name=graph_builder_mode,
+        method_name=topology_method,
         road_segments=road_segments,
     )
     plot_influence_curve(
@@ -1266,6 +1383,7 @@ def run_visualization(
         avg_curve,
         snapshot_curves,
         avg_breadth,
+        log_y=curve_log_y,
     )
     plot_node_influence_map(
         out_dir / "influence_map.png",
@@ -1273,7 +1391,7 @@ def run_visualization(
         edge_index,
         node_labels,
         node_rows,
-        method_name=graph_builder_mode,
+        method_name=topology_method,
         source_node_index=resolved_focal_node_index,
         source_node_label=(
             node_labels[resolved_focal_node_index]
@@ -1296,7 +1414,7 @@ def run_visualization(
         "checkpoint_path": str(checkpoint_path),
         "net_file": str(env_cfg["net_file"]),
         "route_file": str(env_cfg["route_file"]),
-        "graph_builder_mode": graph_builder_mode,
+        "topology_method": topology_method,
         "device": str(device_obj),
         "num_nodes": len(node_ids),
         "num_directed_edges": int(edge_index.shape[1]),
@@ -1307,6 +1425,10 @@ def run_visualization(
         "representative_snapshot_step": representative_snapshot.step_index,
         "max_hops": resolved_max_hops,
         "curve_num_samples": resolved_curve_samples,
+        "curve_use_all_nodes_when_null": bool(curve_use_all_nodes_when_null),
+        "curve_sampling_mode": curve_sampling_mode,
+        "curve_sampling_seed": curve_sampling_seed,
+        "curve_log_y": bool(curve_log_y),
         "map_num_samples": resolved_map_samples,
         "show_blue_edges_influence_map": bool(show_blue_edges_influence_map),
         "heat_weight_mode": heat_weight_mode,

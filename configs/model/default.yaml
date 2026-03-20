@@ -3,6 +3,9 @@
 # =============================================================
 
 # Graph encoder (GATv2Conv)
+observation_adapter:
+  feature_mode: wave
+
 encoder_cfg:
   hidden_dim: 128
   out_dim: 64

@@ -1,56 +1,64 @@
 from __future__ import annotations
 
-import torch
+from types import SimpleNamespace
 
-from marl_env.reward import IntersectionMetrics, RewardCalculator
-
-
-def test_queue_reward() -> None:
-    calc = RewardCalculator(mode="queue")
-    metrics = IntersectionMetrics(queue_lengths=[1, 2, 3])
-    assert calc.compute(metrics) == -2
+from marl_env.reward import available_reward_names, compute_rewards
 
 
-def test_wait_reward() -> None:
-    calc = RewardCalculator(mode="wait")
-    metrics = IntersectionMetrics(waiting_times=[2.0, 3.0])
-    assert calc.compute(metrics) == -2.5
+class _FakeObservation:
+    def __init__(self, *, total_wait: float, total_queued: float, lane_queues: dict[str, float]) -> None:
+        self.total_wait = total_wait
+        self.total_queued = total_queued
+        self._lane_queues = dict(lane_queues)
+
+    def get_lane(self, lane_id: str) -> SimpleNamespace:
+        return SimpleNamespace(queued=float(self._lane_queues[lane_id]))
 
 
-def test_pressure_reward_uses_pressure_field() -> None:
-    calc = RewardCalculator(mode="pressure")
-    metrics = IntersectionMetrics(pressure=7.0)
-    assert calc.compute(metrics) == -7.0
+def test_available_reward_names_are_resco_compatible() -> None:
+    assert available_reward_names() == ("pressure", "wait")
 
 
-def test_pressure_queue_reward_normalized_queue_penalty() -> None:
-    calc = RewardCalculator(mode="pressure_queue", weights={"pressure": 1.0, "queue": 0.1})
-    metrics = IntersectionMetrics(queue_lengths=[2.0, 4.0], pressure=3.0)
-    # -|3| - 0.1 * ((2+4)/2)
-    assert calc.compute(metrics) == -3.3
+def test_wait_reward_matches_total_wait() -> None:
+    signals = {
+        "J1": SimpleNamespace(
+            observation=_FakeObservation(total_wait=12.5, total_queued=0.0, lane_queues={}),
+            outbound_lanes=[],
+            out_lane_to_signal_id={},
+        )
+    }
+    rewards = compute_rewards(reward_name="wait", signals=signals)
+    assert rewards == {"J1": -12.5}
 
 
-def test_combined_reward_finite() -> None:
-    calc = RewardCalculator(mode="combined")
-    metrics = IntersectionMetrics(
-        queue_lengths=[1, 2],
-        waiting_times=[3.0, 4.0],
-        mean_speeds=[5.0, 7.0],
-        occupancies=[0.2, 0.3],
-        throughput=2,
-    )
-    reward = calc.compute(metrics)
-    assert isinstance(reward, float)
-    assert torch.isfinite(torch.tensor(reward))
+def test_pressure_reward_uses_signed_downstream_balance() -> None:
+    signals = {
+        "J1": SimpleNamespace(
+            observation=_FakeObservation(total_wait=0.0, total_queued=7.0, lane_queues={}),
+            outbound_lanes=["l_out"],
+            out_lane_to_signal_id={"l_out": "J2"},
+        ),
+        "J2": SimpleNamespace(
+            observation=_FakeObservation(total_wait=0.0, total_queued=2.0, lane_queues={"l_out": 3.0}),
+            outbound_lanes=[],
+            out_lane_to_signal_id={},
+        ),
+    }
+    rewards = compute_rewards(reward_name="pressure", signals=signals)
+    assert rewards["J1"] == -(7.0 - 3.0)
 
 
-def test_batch_reward_shape_and_finite() -> None:
-    calc = RewardCalculator(mode="combined")
-    rewards = calc.compute_batch(
-        [
-            IntersectionMetrics(queue_lengths=[1], waiting_times=[1.5], mean_speeds=[3.0]),
-            IntersectionMetrics(queue_lengths=[2], waiting_times=[2.5], mean_speeds=[4.0]),
-        ]
-    )
-    assert rewards.shape == (2,)
-    assert torch.isfinite(rewards).all()
+def test_unknown_reward_name_raises() -> None:
+    signals = {
+        "J1": SimpleNamespace(
+            observation=_FakeObservation(total_wait=0.0, total_queued=0.0, lane_queues={}),
+            outbound_lanes=[],
+            out_lane_to_signal_id={},
+        )
+    }
+    try:
+        compute_rewards(reward_name="queue", signals=signals)
+    except ValueError as exc:
+        assert "Unknown reward" in str(exc)
+    else:  # pragma: no cover - defensive branch
+        raise AssertionError("Expected unknown reward selection to fail.")
