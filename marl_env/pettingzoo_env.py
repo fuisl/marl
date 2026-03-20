@@ -207,7 +207,9 @@ class SumoTrafficParallelEnv(_BaseParallelEnv):
             )
 
         self.edge_index = td.get("edge_index", None)
-        self.edge_attr = td.get("edge_attr", None)
+        graph_metadata = self.core.get_graph_metadata()
+        self.edge_index = graph_metadata.edge_index
+        self.edge_attr = graph_metadata.edge_attr
 
     def _ensure_ready_for_spaces(self, agent: str) -> None:
         if not self._initialized:

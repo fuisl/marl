@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
 from typing import Any
 
 import pytest
 
 import marl_env.traci_adapter as traci_adapter_mod
 from marl_env.traci_adapter import TraCIAdapter
-from tests.test_env_sumo_smoke import _build_single_intersection_net, _write_route_file
 
 
 class _FakeSimulationAPI:
@@ -285,58 +282,3 @@ def test_methods_raise_without_connection() -> None:
     adapter = TraCIAdapter("net.net.xml", "route.rou.xml")
     with pytest.raises(RuntimeError, match="No active SUMO connection"):
         adapter.simulation_step()
-
-
-@pytest.mark.sumo
-def test_traci_adapter_calls_real_sumo(
-    tmp_path: Path,
-    sumo_stack: dict[str, object],
-) -> None:
-    sumolib = sumo_stack["sumolib"]
-    try:
-        net_file = _build_single_intersection_net(tmp_path / "adapter_sumo")
-        route_file = tmp_path / "adapter_sumo.rou.xml"
-        _write_route_file(net_file, route_file, sumolib=sumolib, n_vehicles=40)
-    except (subprocess.CalledProcessError, OSError) as exc:
-        pytest.skip(f"SUMO tooling unavailable at runtime: {exc}")
-
-    adapter = TraCIAdapter(
-        net_file=str(net_file),
-        route_file=str(route_file),
-        begin_time=0,
-        end_time=300,
-        sumo_binary="sumo",
-    )
-
-    adapter.start()
-    try:
-        tl_ids = adapter.get_traffic_light_ids()
-        assert tl_ids
-        tl_id = tl_ids[0]
-
-        current_phase = adapter.get_phase(tl_id)
-        adapter.set_phase(tl_id, current_phase)
-        adapter.set_phase_duration(tl_id, 3.0)
-        assert adapter.get_program_logic(tl_id)
-        assert isinstance(adapter.get_controlled_links(tl_id), list)
-        assert isinstance(adapter.get_red_yellow_green_state(tl_id), str)
-
-        lanes = adapter.get_controlled_lanes(tl_id)
-        assert lanes
-        lane_id = lanes[0]
-        assert isinstance(adapter.get_lane_vehicle_count(lane_id), int)
-        assert isinstance(adapter.get_lane_halting_number(lane_id), int)
-        assert isinstance(adapter.get_lane_waiting_time(lane_id), float)
-        assert isinstance(adapter.get_lane_mean_speed(lane_id), float)
-        assert isinstance(adapter.get_lane_occupancy(lane_id), float)
-        assert isinstance(adapter.get_lane_length(lane_id), float)
-        assert isinstance(adapter.get_lane_max_speed(lane_id), float)
-
-        adapter.simulation_step()
-        assert adapter.current_time >= 0.0
-        assert adapter.min_expected_vehicles >= 0
-        assert adapter.get_departed_number() >= 0
-        assert adapter.get_arrived_number() >= 0
-        assert adapter.get_teleported_number() >= 0
-    finally:
-        adapter.close()

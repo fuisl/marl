@@ -4,11 +4,8 @@ kind: baseline
 
 supports:
   action_space: [discrete]
-  obs_space: [graph, vector]
+  obs_space: [snapshot]
 
 env_overrides:
-  benchmark_mode: resco
-  observation_mode: mplight
-  reward_mode: wait
   step_length: 5
-  benchmark_max_distance: 200
+  max_distance: 200

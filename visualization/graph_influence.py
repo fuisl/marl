@@ -22,6 +22,7 @@ from torch_geometric.data import Data
 from torch_geometric.utils import get_num_hops, k_hop_subgraph
 from torch_geometric.utils.influence import k_hop_subsets_exact
 
+from marl_env.observation_adapter import GraphMetadata, ObservationAdapter
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 
@@ -342,20 +343,27 @@ def count_episode_steps(
     env: TrafficSignalEnv,
     agent: MARLDiscreteSAC,
     device: torch.device | str,
+    adapter: ObservationAdapter,
+    graph_metadata: GraphMetadata,
+    feature_mode: str,
 ) -> int:
     """Count deterministic decision steps in one episode."""
     td = env.reset().to(device)
     steps = 0
 
     while True:
+        graph_obs = adapter.graph_features(
+            td["agents", "observation"],
+            feature_mode=feature_mode,
+        )
         actions, _ = agent.select_action(
-            td.get("graph_observation", td["agents", "observation"]),
-            td["edge_index"],
-            td.get("edge_attr", None),
+            graph_obs,
+            graph_metadata.edge_index.to(device),
+            None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.to(device),
             td["agents", "action_mask"],
             deterministic=True,
-            agent_node_indices=td["agent_node_indices"],
-            agent_node_mask=td["agent_node_mask"],
+            agent_node_indices=graph_metadata.agent_node_indices.to(device),
+            agent_node_mask=graph_metadata.agent_node_mask.to(device),
         )
 
         next_td = env.step(actions.cpu()).to(device)
@@ -373,6 +381,9 @@ def collect_snapshot_graphs(
     agent: MARLDiscreteSAC,
     device: torch.device | str,
     snapshot_steps: list[int],
+    adapter: ObservationAdapter,
+    graph_metadata: GraphMetadata,
+    feature_mode: str,
 ) -> list[SnapshotGraph]:
     """Collect graph snapshots at selected decision steps."""
     wanted = set(snapshot_steps)
@@ -382,27 +393,34 @@ def collect_snapshot_graphs(
 
     while True:
         if step_index in wanted:
-            graph_obs = td.get("graph_observation", td["agents", "observation"])
+            graph_obs = adapter.graph_features(
+                td["agents", "observation"],
+                feature_mode=feature_mode,
+            )
             snapshots.append(
                 SnapshotGraph(
                     step_index=step_index,
                     data=Data(
                         x=graph_obs.detach().cpu(),
-                        edge_index=td["edge_index"].detach().cpu(),
-                        edge_attr=_extract_edge_attr(td),
+                        edge_index=graph_metadata.edge_index.detach().cpu(),
+                        edge_attr=None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.detach().cpu(),
                         num_nodes=int(graph_obs.shape[0]),
                     ),
                 )
             )
 
+        graph_obs = adapter.graph_features(
+            td["agents", "observation"],
+            feature_mode=feature_mode,
+        )
         actions, _ = agent.select_action(
-            td.get("graph_observation", td["agents", "observation"]),
-            td["edge_index"],
-            td.get("edge_attr", None),
+            graph_obs,
+            graph_metadata.edge_index.to(device),
+            None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.to(device),
             td["agents", "action_mask"],
             deterministic=True,
-            agent_node_indices=td["agent_node_indices"],
-            agent_node_mask=td["agent_node_mask"],
+            agent_node_indices=graph_metadata.agent_node_indices.to(device),
+            agent_node_mask=graph_metadata.agent_node_mask.to(device),
         )
 
         next_td = env.step(actions.cpu()).to(device)
@@ -422,11 +440,11 @@ def collect_snapshot_graphs(
 def load_agent_for_visualization(
     checkpoint_path: Path,
     model_cfg: dict[str, Any],
-    td0: TensorDict,
+    graph_observation: Tensor,
     num_actions: int,
     device: torch.device,
 ) -> MARLDiscreteSAC:
-    obs_dim = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
+    obs_dim = int(graph_observation.shape[-1])
 
     agent = MARLDiscreteSAC(
         obs_dim=obs_dim,
@@ -1239,6 +1257,18 @@ def run_visualization(
     env = TrafficSignalEnv(**env_cfg)
     try:
         td0 = env.reset()
+        graph_metadata = env.get_graph_metadata()
+        feature_mode = str(dict(model_cfg.get("observation_adapter", {})).get("feature_mode", "wave"))
+        adapter = ObservationAdapter(
+            signal_specs=env.get_signal_specs(),
+            tl_ids=env.tl_ids,
+            layout=env.observation_layout,
+            graph_metadata=graph_metadata,
+        )
+        graph_obs0 = adapter.graph_features(
+            td0["agents", "observation"],
+            feature_mode=feature_mode,
+        )
         node_ids = list(env.graph_builder.node_ids)  # type: ignore[union-attr]
         attached_rl_ids_by_node = list(env.graph_builder.attached_rl_ids_by_node)  # type: ignore[union-attr]
         node_labels = [
@@ -1252,14 +1282,14 @@ def run_visualization(
         node_is_signal = [len(attached_rl_ids) > 0 for attached_rl_ids in attached_rl_ids_by_node]
         positions = env.graph_builder.node_positions.detach().cpu()  # type: ignore[union-attr]
         road_segments = extract_road_segments(env.graph_builder.net)  # type: ignore[union-attr]
-        edge_index = td0["edge_index"].detach().cpu()
-        edge_attr = _extract_edge_attr(td0)
-        graph_builder_mode = env.graph_builder.mode  # type: ignore[union-attr]
+        edge_index = graph_metadata.edge_index.detach().cpu()
+        edge_attr = None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.detach().cpu()
+        topology_method = "all_intersections"
 
         agent = load_agent_for_visualization(
             checkpoint_path=checkpoint_path,
             model_cfg=model_cfg,
-            td0=td0,
+            graph_observation=graph_obs0,
             num_actions=env.num_actions,
             device=device_obj,
         )
@@ -1267,9 +1297,24 @@ def run_visualization(
         influence_model.eval()
 
         resolved_max_hops = resolve_max_hops(influence_model, max_hops)
-        episode_steps = count_episode_steps(env, agent, device_obj)
+        episode_steps = count_episode_steps(
+            env,
+            agent,
+            device_obj,
+            adapter,
+            graph_metadata,
+            feature_mode,
+        )
         snapshot_steps = evenly_spaced_indices(episode_steps, num_snapshots)
-        snapshots = collect_snapshot_graphs(env, agent, device_obj, snapshot_steps)
+        snapshots = collect_snapshot_graphs(
+            env,
+            agent,
+            device_obj,
+            snapshot_steps,
+            adapter,
+            graph_metadata,
+            feature_mode,
+        )
     finally:
         env.close()
 
@@ -1330,7 +1375,7 @@ def run_visualization(
         edge_index,
         node_labels,
         node_is_signal,
-        method_name=graph_builder_mode,
+        method_name=topology_method,
         road_segments=road_segments,
     )
     plot_influence_curve(
@@ -1346,7 +1391,7 @@ def run_visualization(
         edge_index,
         node_labels,
         node_rows,
-        method_name=graph_builder_mode,
+        method_name=topology_method,
         source_node_index=resolved_focal_node_index,
         source_node_label=(
             node_labels[resolved_focal_node_index]
@@ -1369,7 +1414,7 @@ def run_visualization(
         "checkpoint_path": str(checkpoint_path),
         "net_file": str(env_cfg["net_file"]),
         "route_file": str(env_cfg["route_file"]),
-        "graph_builder_mode": graph_builder_mode,
+        "topology_method": topology_method,
         "device": str(device_obj),
         "num_nodes": len(node_ids),
         "num_directed_edges": int(edge_index.shape[1]),

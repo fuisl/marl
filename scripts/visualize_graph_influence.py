@@ -39,7 +39,7 @@ def main(cfg: DictConfig) -> None:
     env_cfg = {**env_common, **scenario_params}
 
     env_name = Path(str(env_cfg["net_file"])).stem
-    method_name = str(env_cfg.get("graph_builder_mode", "original"))
+    method_name = "all_intersections"
 
     out_dir_raw = cfg.runtime.out_dir
     if out_dir_raw in (None, ""):

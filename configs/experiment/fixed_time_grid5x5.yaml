@@ -1,5 +1,5 @@
 defaults:
-  - override /algo: fixed_time_baseline
+  - override /algo: fixed
   - override /scenario: grid4x4
   - _self_
 

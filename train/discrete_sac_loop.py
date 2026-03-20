@@ -39,6 +39,7 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
+from marl_env.observation_adapter import GraphMetadata, ObservationAdapter  # noqa: E402
 from marl_env.sumo_env import TrafficSignalEnv  # noqa: E402
 from models.marl_discrete_sac import MARLDiscreteSAC  # noqa: E402
 from rl.losses import DiscreteSACLossComputer  # noqa: E402
@@ -85,6 +86,10 @@ def pack_transition(
     td: TensorDict,
     actions: Tensor,
     next_td: TensorDict,
+    *,
+    graph_observation: Tensor,
+    next_graph_observation: Tensor,
+    graph_metadata: GraphMetadata,
 ) -> TensorDict:
     """Pack ``(obs, action, next_obs, reward, done)`` into a replay-ready TensorDict.
 
@@ -127,22 +132,19 @@ def pack_transition(
                         },
                         batch_size=[n],
                     ),
-                    "graph_observation": next_td.get(
-                        "graph_observation",
-                        next_td["agents", "observation"],
-                    ),
+                    "graph_observation": next_graph_observation,
                 },
                 batch_size=[],
             ),
-            "graph_observation": td.get("graph_observation", td["agents", "observation"]),
-            "agent_node_indices": td["agent_node_indices"],
-            "agent_node_mask": td["agent_node_mask"],
-            "edge_index": td["edge_index"],
+            "graph_observation": graph_observation,
+            "agent_node_indices": graph_metadata.agent_node_indices,
+            "agent_node_mask": graph_metadata.agent_node_mask,
+            "edge_index": graph_metadata.edge_index,
         },
         batch_size=[],
     )
-    if "edge_attr" in td.keys():
-        t["edge_attr"] = td["edge_attr"]
+    if graph_metadata.edge_attr is not None:
+        t["edge_attr"] = graph_metadata.edge_attr
     return t
 
 
@@ -215,6 +217,9 @@ def run_episode(
     env: TrafficSignalEnv,
     agent: MARLDiscreteSAC,
     device: torch.device,
+    adapter: ObservationAdapter,
+    feature_mode: str,
+    graph_metadata: GraphMetadata,
     *,
     deterministic: bool = False,
 ) -> tuple[list[TensorDict], float, int, dict[str, float]]:
@@ -233,12 +238,19 @@ def run_episode(
     transitions: list[TensorDict] = []
 
     while True:
-        obs = td.get("graph_observation", td["agents", "observation"])
-        edge_index = td["edge_index"]
-        edge_attr = td.get("edge_attr", None)
+        obs = adapter.graph_features(
+            td["agents", "observation"],
+            feature_mode=feature_mode,
+        ).to(device)
+        edge_index = graph_metadata.edge_index.to(device)
+        edge_attr = (
+            None
+            if graph_metadata.edge_attr is None
+            else graph_metadata.edge_attr.to(device)
+        )
         mask = td["agents", "action_mask"]
-        agent_node_indices = td["agent_node_indices"]
-        agent_node_mask = td["agent_node_mask"]
+        agent_node_indices = graph_metadata.agent_node_indices.to(device)
+        agent_node_mask = graph_metadata.agent_node_mask.to(device)
 
         actions, _ = agent.select_action(
             obs,
@@ -251,13 +263,26 @@ def run_episode(
         )
 
         next_td = env.step(actions.cpu()).to(device)
-        transitions.append(pack_transition(td.cpu(), actions.cpu(), next_td.cpu()))
+        next_obs = adapter.graph_features(
+            next_td["agents", "observation"],
+            feature_mode=feature_mode,
+        ).to(device)
+        transitions.append(
+            pack_transition(
+                td.cpu(),
+                actions.cpu(),
+                next_td.cpu(),
+                graph_observation=obs.cpu(),
+                next_graph_observation=next_obs.cpu(),
+                graph_metadata=graph_metadata,
+            )
+        )
 
         if next_td["done"].item():
             break
         td = next_td
 
-    validation_metrics = dict(env.get_episode_kpis())
+    validation_metrics = dict(env.get_episode_metrics())
     return transitions, float(validation_metrics.get("global_reward", 0.0)), len(transitions), validation_metrics
 
 
@@ -325,9 +350,7 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = int(cfg.train.seed)
     base_optimizer_name = str(cfg.train.optimizer.name)
-    reward_mode = str(cfg.env.reward_mode)
-    if str(getattr(cfg.env, "benchmark_mode", "native")) != "resco":
-        raise ValueError("The public training benchmark path requires env.benchmark_mode='resco'.")
+    reward_name = str(cfg.env.reward_name)
     print(f"[train_gat_baseline] device={device}")
     print(f"  net:   {cfg.env.net_file}")
     print(f"  route: {cfg.env.route_file}")
@@ -344,8 +367,7 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         route_file=cfg.env.route_file,
         delta_t=int(cfg.env.delta_t),
         step_length=int(cfg.env.step_length) if getattr(cfg.env, "step_length", None) is not None else None,
-        reward_mode=cfg.env.reward_mode,
-        reward_weights=maybe_to_container(cfg.env.reward_weights),
+        reward_name=cfg.env.reward_name,
         yellow_duration=int(cfg.env.yellow_duration),
         all_red_duration=int(cfg.env.all_red_duration),
         min_green_duration=int(cfg.env.min_green_duration),
@@ -354,19 +376,30 @@ def train(cfg: DictConfig) -> dict[str, Any]:
         begin_time=int(cfg.env.begin_time),
         end_time=int(cfg.env.end_time),
         additional_files=additional_files,
-        graph_builder_mode=str(getattr(cfg.env, "graph_builder_mode", "original")),
         timeloss_subscription_policy=str(getattr(cfg.env, "timeloss_subscription_policy", "strict")),
-        benchmark_mode=str(getattr(cfg.env, "benchmark_mode", "native")),
-        observation_mode=str(getattr(cfg.env, "observation_mode", "graph")),
-        benchmark_max_distance=int(getattr(cfg.env, "benchmark_max_distance", 200)),
-        benchmark_output_dir=str(out_dir),
+        max_distance=int(getattr(cfg.env, "max_distance", 200)),
+        output_dir=str(out_dir),
     )
 
     td0 = env.reset()
-    obs_dim     = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
+    observation_adapter_cfg = maybe_to_container(cfg.model.get("observation_adapter", {})) or {}
+    feature_mode = str(observation_adapter_cfg.get("feature_mode", "wave"))
+    graph_metadata = env.get_graph_metadata()
+    adapter = ObservationAdapter(
+        signal_specs=env.get_signal_specs(),
+        tl_ids=env.tl_ids,
+        layout=env.observation_layout,
+        graph_metadata=graph_metadata,
+    )
+    obs_dim = int(
+        adapter.graph_features(
+            td0["agents", "observation"],
+            feature_mode=feature_mode,
+        ).shape[-1]
+    )
     num_actions = env.num_actions
     n_agents    = env.n_agents
-    n_edges     = int(td0["edge_index"].shape[1])
+    n_edges     = int(graph_metadata.edge_index.shape[1])
     print(
         f"  agents={n_agents}  obs_dim={obs_dim}"
         f"  num_actions={num_actions}  graph_edges={n_edges}"
@@ -423,7 +456,7 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     if wandb_run.enabled:
         run_name = cfg.wandb.run_name
         if not run_name:
-            run_name = f"gat_a{actor_opt_name}_c{critic_opt_name}_{reward_mode}_seed{seed}"
+            run_name = f"gat_a{actor_opt_name}_c{critic_opt_name}_{reward_name}_seed{seed}"
         wandb_cfg_raw = OmegaConf.to_container(cfg, resolve=True)
         wandb_cfg: dict[str, Any] | None = None
         if isinstance(wandb_cfg_raw, dict):
@@ -437,14 +470,15 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             "run_name": str(run_name),
             "optimizer_actor": actor_opt_name,
             "optimizer_critic": critic_opt_name,
-            "reward_mode": reward_mode,
+            "reward_name": reward_name,
+            "feature_mode": feature_mode,
         }
         wandb_run.init_training_run(
             project=str(cfg.wandb.project),
             run_name=str(run_name),
             run_config=wandb_cfg,
             out_dir=out_dir,
-            tags=["gat", "discrete-sac", "resco", actor_opt_name, critic_opt_name, reward_mode],
+            tags=["gat", "discrete-sac", "resco", actor_opt_name, critic_opt_name, reward_name, feature_mode],
             run_metadata=run_metadata,
         )
 
@@ -474,7 +508,14 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     try:
         for ep in range(1, int(cfg.train.episodes) + 1):
             agent.train()
-            transitions, ep_return, ep_steps, validation_metrics = run_episode(env, agent, device)
+            transitions, ep_return, ep_steps, validation_metrics = run_episode(
+                env,
+                agent,
+                device,
+                adapter,
+                feature_mode,
+                graph_metadata,
+            )
 
             for t in transitions:
                 replay.push(t)

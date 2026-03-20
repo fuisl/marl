@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,6 +12,56 @@ def _import_parallel_env_or_skip():
     from marl_env.pettingzoo_env import SumoTrafficParallelEnv
 
     return SumoTrafficParallelEnv
+
+
+FAKE_METADATA = {
+    "phase_pairs": [["N-N", "S-S"], ["S-S", "N-N"]],
+    "J1": {
+        "lane_sets": {
+            "N-N": ["j1_l1"],
+            "S-S": ["j1_l2"],
+        },
+        "downstream": {
+            "N": "J2",
+            "S": None,
+        },
+        "fixed_timings": [10, 10],
+        "fixed_phase_order_idx": 0,
+        "fixed_offset": 0,
+        "pair_to_act_map": {0: 0, 1: 1},
+    },
+    "J2": {
+        "lane_sets": {
+            "N-N": ["j2_l1"],
+            "S-S": ["j2_l2"],
+        },
+        "downstream": {
+            "N": None,
+            "S": "J1",
+        },
+        "fixed_timings": [10, 10],
+        "fixed_phase_order_idx": 0,
+        "fixed_offset": 0,
+        "pair_to_act_map": {0: 0, 1: 1},
+    },
+}
+
+HETERO_METADATA = {
+    "phase_pairs": [["N-N", "S-S"], ["S-S", "N-N"]],
+    "J1": FAKE_METADATA["J1"],
+    "J2": {
+        "lane_sets": {
+            "N-N": ["j2_l1"],
+        },
+        "downstream": {
+            "N": None,
+        },
+        "fixed_timings": [10],
+        "fixed_phase_order_idx": 0,
+        "fixed_offset": 0,
+        "pair_to_act_map": {0: 0},
+    },
+}
 
 
 class FakePhase:
@@ -26,6 +78,7 @@ class FakeTraCIAdapter:
     def __init__(self, done_after: int = 20) -> None:
         self.done_after = done_after
         self.time = 0
+        self.tripinfo_output: str | None = None
         self.tl_ids = ["J1", "J2"]
         self.lanes = {
             "J1": ["j1_l1", "j1_l2"],
@@ -34,6 +87,7 @@ class FakeTraCIAdapter:
         self.phases = {tl_id: 0 for tl_id in self.tl_ids}
         self._phase_durations = {0: 999, 1: 1, 2: 1, 3: 999, 4: 1, 5: 1}
         self._remaining = {tl_id: self._phase_durations[0] for tl_id in self.tl_ids}
+        self._context: dict[str, dict[str, dict[int, object]]] = {}
 
     def start(self) -> None:
         self.time = 0
@@ -42,6 +96,9 @@ class FakeTraCIAdapter:
 
     def close(self, wait: bool = False) -> None:
         _ = wait
+
+    def set_tripinfo_output(self, path: str | None) -> None:
+        self.tripinfo_output = path
 
     def simulation_step(self) -> None:
         self.time += 1
@@ -94,63 +151,76 @@ class FakeTraCIAdapter:
     def get_controlled_lanes(self, tl_id: str) -> list[str]:
         return self.lanes[tl_id]
 
-    def get_controlled_links(self, tl_id: str) -> list[list[tuple[str, str, str]]]:
-        # Mimic TraCI shape: list over signal indices, each containing
-        # (in_lane, out_lane, via_lane) tuples.
-        lanes = self.lanes[tl_id]
-        return [
-            [(lanes[0], lanes[0], "")],
-            [(lanes[1], lanes[1], "")],
-        ]
-
-    @staticmethod
-    def get_arrived_number() -> int:
+    def get_arrived_number(self) -> int:
         return 0
 
-    @staticmethod
-    def get_departed_number() -> int:
+    def get_departed_number(self) -> int:
         return 0
 
-    @staticmethod
-    def get_teleported_number() -> int:
+    def get_teleported_number(self) -> int:
         return 0
 
-    @staticmethod
-    def get_arrived_ids() -> list[str]:
-        return []
+    def subscribe_junction_context(
+        self,
+        junction_id: str,
+        radius: float,
+        variables: list[int],
+    ) -> None:
+        _ = radius
+        self._context[junction_id] = self._build_context_results(junction_id, variables)
+
+    def get_junction_context_subscription_results(self, junction_id: str) -> dict[str, dict[int, object]]:
+        return dict(self._context.get(junction_id, {}))
+
+    def _build_context_results(
+        self,
+        junction_id: str,
+        variables: list[int],
+    ) -> dict[str, dict[int, object]]:
+        values_by_lane = {
+            "J1": [("veh_j1", "j1_l1", 0.0)],
+            "J2": [("veh_j2", "j2_l1", 0.0)],
+        }
+        results: dict[str, dict[int, object]] = {}
+        for veh_id, lane_id, speed in values_by_lane.get(junction_id, []):
+            entry: dict[int, object] = {}
+            for variable in variables:
+                if variable == 81:
+                    entry[variable] = lane_id
+                elif variable == 86:
+                    entry[variable] = 90.0
+                elif variable == 114:
+                    entry[variable] = 0.0
+                elif variable == 64:
+                    entry[variable] = speed
+                elif variable == 101:
+                    entry[variable] = 0.0
+                elif variable == 122:
+                    entry[variable] = 0.0
+                elif variable == 177:
+                    entry[variable] = 10.0
+                elif variable == 79:
+                    entry[variable] = "car"
+                elif variable == 140:
+                    entry[variable] = 0.0
+            results[veh_id] = entry
+        return results
 
     @staticmethod
-    def get_departed_ids() -> list[str]:
-        return []
+    def get_lane_length(lane_id: str) -> float:
+        _ = lane_id
+        return 100.0
 
     @staticmethod
-    def get_lane_vehicle_count(lane_id: str) -> int:
-        return 1 if lane_id.endswith("1") else 2
-
-    @staticmethod
-    def get_lane_halting_number(lane_id: str) -> int:
-        return 1 if lane_id.endswith("1") else 2
-
-    @staticmethod
-    def get_lane_waiting_time(lane_id: str) -> float:
-        return 2.0 if lane_id.endswith("1") else 3.0
-
-    @staticmethod
-    def get_lane_occupancy(lane_id: str) -> float:
-        return 0.1 if lane_id.endswith("1") else 0.2
-
-    @staticmethod
-    def get_lane_mean_speed(lane_id: str) -> float:
-        return 5.0 if lane_id.endswith("1") else 6.0
+    def get_lane_max_speed(lane_id: str) -> float:
+        _ = lane_id
+        return 10.0
 
 
 class FakeTraCIAdapterHeteroActions(FakeTraCIAdapter):
     def get_program_logic(self, tl_id: str) -> list[FakeLogic]:
         if tl_id == "J1":
-            # Two controllable greens: phases 0 and 3
             return super().get_program_logic(tl_id)
-
-        # One controllable green: phase 0 only
         return [
             FakeLogic(
                 [
@@ -169,7 +239,7 @@ class FakeGraphBuilder:
         net_file: str,
         tl_ids: list[str],
         *,
-        mode: str = "original",
+        mode: str = "all_intersections",
     ) -> None:
         self.net_file = net_file
         self.tl_ids = tl_ids
@@ -177,6 +247,8 @@ class FakeGraphBuilder:
         self.node_ids = list(tl_ids)
         self.agent_node_indices = torch.tensor([[0], [1]], dtype=torch.long)
         self.agent_node_mask = torch.tensor([[True], [True]], dtype=torch.bool)
+        self.node_positions = torch.zeros((2, 2), dtype=torch.float32)
+        self.net = SimpleNamespace()
 
     def build(self):
         edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
@@ -188,12 +260,30 @@ class FakeGraphBuilder:
         return [(tl_id,) for tl_id in self.tl_ids]
 
 
-def _make_env(monkeypatch: object, done_after: int = 20):
-    from marl_env.sumo_env import TrafficSignalEnv
+def _patch_env_dependencies(monkeypatch: object, metadata: dict[str, object]) -> None:
     import marl_env.sumo_env as sumo_env_mod
 
-    SumoTrafficParallelEnv = _import_parallel_env_or_skip()
+    fake_tc = SimpleNamespace(
+        VAR_LANE_ID=81,
+        VAR_LANEPOSITION=86,
+        VAR_ACCELERATION=114,
+        VAR_SPEED=64,
+        VAR_FUELCONSUMPTION=101,
+        VAR_WAITING_TIME=122,
+        VAR_ALLOWED_SPEED=177,
+        VAR_TYPE=79,
+        VAR_TIMELOSS=140,
+    )
     monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
+    monkeypatch.setattr(sumo_env_mod, "get_resco_map_metadata", lambda **_: metadata)
+    monkeypatch.setattr(sumo_env_mod, "tc", fake_tc)
+
+
+def _make_env(monkeypatch: object, done_after: int = 20):
+    from marl_env.sumo_env import TrafficSignalEnv
+
+    SumoTrafficParallelEnv = _import_parallel_env_or_skip()
+    _patch_env_dependencies(monkeypatch, FAKE_METADATA)
 
     core = TrafficSignalEnv(
         net_file="dummy.net.xml",
@@ -202,16 +292,14 @@ def _make_env(monkeypatch: object, done_after: int = 20):
         min_green_duration=0,
     )
     core.adapter = FakeTraCIAdapter(done_after=done_after)
-
     return SumoTrafficParallelEnv(core_env=core)
 
 
 def _make_env_hetero_actions(monkeypatch: object, done_after: int = 20):
     from marl_env.sumo_env import TrafficSignalEnv
-    import marl_env.sumo_env as sumo_env_mod
 
     SumoTrafficParallelEnv = _import_parallel_env_or_skip()
-    monkeypatch.setattr(sumo_env_mod, "GraphBuilder", FakeGraphBuilder)
+    _patch_env_dependencies(monkeypatch, HETERO_METADATA)
 
     core = TrafficSignalEnv(
         net_file="dummy.net.xml",
@@ -220,7 +308,6 @@ def _make_env_hetero_actions(monkeypatch: object, done_after: int = 20):
         min_green_duration=0,
     )
     core.adapter = FakeTraCIAdapterHeteroActions(done_after=done_after)
-
     return SumoTrafficParallelEnv(core_env=core)
 
 

@@ -12,6 +12,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 
 from config_utils import load_dotenv, resolve_repo_path
+from marl_env.observation_adapter import ObservationAdapter
 from marl_env.resco_reporting import to_public_metrics
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
@@ -38,14 +39,26 @@ def evaluate(
     """
     # Override GUI setting for visual evaluation
     env_cfg = {**env_cfg, "gui": gui}
-    if str(env_cfg.get("benchmark_mode", "native")) != "resco":
-        raise ValueError("The public evaluation benchmark path requires benchmark_mode='resco'.")
     if output_dir not in (None, ""):
-        env_cfg.setdefault("benchmark_output_dir", output_dir)
+        env_cfg.setdefault("output_dir", output_dir)
 
     env = TrafficSignalEnv(**env_cfg)
     td0 = env.reset()
-    obs_dim = int(td0.get("graph_observation", td0["agents", "observation"]).shape[-1])
+    observation_adapter_cfg = dict(model_cfg.get("observation_adapter", {}))
+    feature_mode = str(observation_adapter_cfg.get("feature_mode", "wave"))
+    graph_metadata = env.get_graph_metadata()
+    adapter = ObservationAdapter(
+        signal_specs=env.get_signal_specs(),
+        tl_ids=env.tl_ids,
+        layout=env.observation_layout,
+        graph_metadata=graph_metadata,
+    )
+    obs_dim = int(
+        adapter.graph_features(
+            td0["agents", "observation"],
+            feature_mode=feature_mode,
+        ).shape[-1]
+    )
     num_actions = int(env.num_actions)
 
     agent = MARLDiscreteSAC(
@@ -63,9 +76,16 @@ def evaluate(
         steps = 0
 
         while True:
-            obs = td.get("graph_observation", td["agents", "observation"])
-            edge_index = td["edge_index"]
-            edge_attr = td.get("edge_attr", None)
+            obs = adapter.graph_features(
+                td["agents", "observation"],
+                feature_mode=feature_mode,
+            )
+            edge_index = graph_metadata.edge_index.to(device)
+            edge_attr = (
+                None
+                if graph_metadata.edge_attr is None
+                else graph_metadata.edge_attr.to(device)
+            )
             action_mask = td["agents", "action_mask"]
 
             actions, _ = agent.select_action(
@@ -74,8 +94,8 @@ def evaluate(
                 edge_attr,
                 action_mask,
                 deterministic=True,
-                agent_node_indices=td["agent_node_indices"],
-                agent_node_mask=td["agent_node_mask"],
+                agent_node_indices=graph_metadata.agent_node_indices.to(device),
+                agent_node_mask=graph_metadata.agent_node_mask.to(device),
             )
 
             next_td = env.step(actions.cpu()).to(device)
@@ -85,7 +105,7 @@ def evaluate(
                 break
             td = next_td
 
-        episode_kpis = dict(env.get_episode_kpis())
+        episode_kpis = dict(env.get_episode_metrics())
         enriched_info = {
             "Episode": float(ep + 1),
             "Episode Length": float(steps),

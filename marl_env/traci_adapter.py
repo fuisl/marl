@@ -52,7 +52,6 @@ class TraCIAdapter:
         extra_args: list[str] | None = None,
         label: str = "default",
         timeloss_subscription_policy: str = "strict",
-        benchmark_mode: str = "native",
         tripinfo_output: str | None = None,
     ) -> None:
         self.net_file = net_file
@@ -61,7 +60,6 @@ class TraCIAdapter:
         self.begin_time = begin_time
         self.end_time = end_time
         self.label = label
-        self.benchmark_mode = benchmark_mode
         if timeloss_subscription_policy not in _TIMELOSS_SUB_POLICIES:
             raise ValueError(
                 "timeloss_subscription_policy must be one of "
@@ -348,20 +346,17 @@ class TraCIAdapter:
         ]
         if self._additional_files:
             cmd += ["-a", ",".join(self._additional_files)]
-        if self.benchmark_mode == "resco":
+        cmd += [
+            "--random", "True",
+            "--extrapolate-departpos", "True",
+        ]
+        if self.tripinfo_output:
             cmd += [
-                "--random", "True",
-                "--extrapolate-departpos", "True",
+                "--tripinfo-output", self.tripinfo_output,
+                "--tripinfo-output.write-unfinished", "True",
+                "--tripinfo-output.write-undeparted", "True",
+                "--eager-insert", "True",
             ]
-            if self.tripinfo_output:
-                cmd += [
-                    "--tripinfo-output", self.tripinfo_output,
-                    "--tripinfo-output.write-unfinished", "True",
-                    "--tripinfo-output.write-undeparted", "True",
-                    "--eager-insert", "True",
-                ]
-        elif self.tripinfo_output:
-            cmd += ["--tripinfo-output", self.tripinfo_output]
 
         if self._extra_args:
             cmd += list(self._extra_args)

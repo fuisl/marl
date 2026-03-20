@@ -10,6 +10,7 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
+from marl_env.observation_adapter import ObservationAdapter
 from marl_env.sumo_env import TrafficSignalEnv
 from models.marl_discrete_sac import MARLDiscreteSAC
 
@@ -32,17 +33,24 @@ class RolloutWorker:
         env: TrafficSignalEnv,
         agent: MARLDiscreteSAC,
         device: torch.device | str = "cpu",
+        *,
+        feature_mode: str = "wave",
     ) -> None:
         self.env = env
         self.agent = agent
         self.device = torch.device(device)
+        self.feature_mode = feature_mode
+        self.adapter: ObservationAdapter | None = None
 
-    @staticmethod
-    def _graph_inputs(td: TensorDict) -> tuple[Tensor, Tensor | None, Tensor | None]:
-        graph_obs = td.get("graph_observation", td["agents", "observation"])
-        agent_node_indices = td.get("agent_node_indices", None)
-        agent_node_mask = td.get("agent_node_mask", None)
-        return graph_obs, agent_node_indices, agent_node_mask
+    def _ensure_adapter(self) -> ObservationAdapter:
+        if self.adapter is None:
+            self.adapter = ObservationAdapter(
+                signal_specs=self.env.get_signal_specs(),
+                tl_ids=self.env.tl_ids,
+                layout=self.env.observation_layout,
+                graph_metadata=self.env.get_graph_metadata(),
+            )
+        return self.adapter
 
     # ------------------------------------------------------------------
     # Public API
@@ -61,14 +69,23 @@ class RolloutWorker:
         transitions: list[TensorDict] = []
         td = self.env.reset()
         td = td.to(self.device)
+        adapter = self._ensure_adapter()
+        graph_metadata = self.env.get_graph_metadata()
 
         for _ in range(n_steps):
-            obs, agent_node_indices, agent_node_mask = self._graph_inputs(td)
-            edge_index = td["edge_index"]
-            edge_attr = td.get("edge_attr", None)
+            obs = adapter.graph_features(
+                td["agents", "observation"],
+                feature_mode=self.feature_mode,
+            )
+            edge_index = graph_metadata.edge_index.to(self.device)
+            edge_attr = (
+                None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.to(self.device)
+            )
             action_mask = td["agents", "action_mask"]
+            agent_node_indices = graph_metadata.agent_node_indices.to(self.device)
+            agent_node_mask = graph_metadata.agent_node_mask.to(self.device)
 
-            actions, log_probs = self.agent.select_action(
+            actions, _ = self.agent.select_action(
                 obs,
                 edge_index,
                 edge_attr,
@@ -80,8 +97,22 @@ class RolloutWorker:
 
             next_td = self.env.step(actions.cpu())
             next_td = next_td.to(self.device)
+            next_obs = adapter.graph_features(
+                next_td["agents", "observation"],
+                feature_mode=self.feature_mode,
+            )
 
-            transition = self._pack_transition(td, actions, next_td)
+            transition = self._pack_transition(
+                td,
+                actions,
+                next_td,
+                obs,
+                next_obs,
+                edge_index,
+                edge_attr,
+                agent_node_indices,
+                agent_node_mask,
+            )
             transitions.append(transition.cpu())
 
             # Check done
@@ -99,15 +130,24 @@ class RolloutWorker:
         """Run one full episode. Return transitions and summary metrics."""
         transitions: list[TensorDict] = []
         td = self.env.reset().to(self.device)
+        adapter = self._ensure_adapter()
+        graph_metadata = self.env.get_graph_metadata()
 
         total_reward = 0.0
         steps = 0
 
         while True:
-            obs, agent_node_indices, agent_node_mask = self._graph_inputs(td)
-            edge_index = td["edge_index"]
-            edge_attr = td.get("edge_attr", None)
+            obs = adapter.graph_features(
+                td["agents", "observation"],
+                feature_mode=self.feature_mode,
+            )
+            edge_index = graph_metadata.edge_index.to(self.device)
+            edge_attr = (
+                None if graph_metadata.edge_attr is None else graph_metadata.edge_attr.to(self.device)
+            )
             action_mask = td["agents", "action_mask"]
+            agent_node_indices = graph_metadata.agent_node_indices.to(self.device)
+            agent_node_mask = graph_metadata.agent_node_mask.to(self.device)
 
             actions, _ = self.agent.select_action(
                 obs,
@@ -120,8 +160,22 @@ class RolloutWorker:
             )
 
             next_td = self.env.step(actions.cpu()).to(self.device)
+            next_obs = adapter.graph_features(
+                next_td["agents", "observation"],
+                feature_mode=self.feature_mode,
+            )
 
-            transition = self._pack_transition(td, actions, next_td)
+            transition = self._pack_transition(
+                td,
+                actions,
+                next_td,
+                obs,
+                next_obs,
+                edge_index,
+                edge_attr,
+                agent_node_indices,
+                agent_node_mask,
+            )
             transitions.append(transition.cpu())
 
             total_reward += next_td["agents", "reward"].sum().item()
@@ -145,6 +199,12 @@ class RolloutWorker:
         td: TensorDict,
         actions: Tensor,
         next_td: TensorDict,
+        graph_observation: Tensor,
+        next_graph_observation: Tensor,
+        edge_index: Tensor,
+        edge_attr: Tensor | None,
+        agent_node_indices: Tensor,
+        agent_node_mask: Tensor,
     ) -> TensorDict:
         """Pack current obs, action, reward, next obs into a flat transition."""
         transition = TensorDict(
@@ -169,20 +229,17 @@ class RolloutWorker:
                             },
                             batch_size=td["agents"].batch_size,
                         ),
-                        "graph_observation": next_td.get(
-                            "graph_observation",
-                            next_td["agents", "observation"],
-                        ),
+                        "graph_observation": next_graph_observation,
                     },
                     batch_size=[],
                 ),
-                "graph_observation": td.get("graph_observation", td["agents", "observation"]),
-                "agent_node_indices": td["agent_node_indices"],
-                "agent_node_mask": td["agent_node_mask"],
-                "edge_index": td["edge_index"],
+                "graph_observation": graph_observation,
+                "agent_node_indices": agent_node_indices,
+                "agent_node_mask": agent_node_mask,
+                "edge_index": edge_index,
             },
             batch_size=[],
         )
-        if "edge_attr" in td.keys():
-            transition["edge_attr"] = td["edge_attr"]
+        if edge_attr is not None:
+            transition["edge_attr"] = edge_attr
         return transition

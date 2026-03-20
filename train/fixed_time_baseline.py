@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from config_utils import load_dotenv
+from marl_env.observation_adapter import ObservationAdapter
 from marl_env.resco_metadata import SUPPORTED_RESCO_MAPS, get_resco_map_metadata
 from marl_env.resco_reporting import to_public_metrics
 from marl_env.sumo_env import TrafficSignalEnv
@@ -33,7 +34,10 @@ load_dotenv()
 def _build_static_actions(
     *,
     policy_name: str,
-    env: TrafficSignalEnv,
+    signal_specs: dict[str, dict[str, Any]],
+    observations: torch.Tensor,
+    adapter: ObservationAdapter,
+    tl_ids: list[str],
     fixed_controllers: dict[str, RescoFixedSignalController],
     stochastic_rng: random.Random,
 ) -> torch.Tensor:
@@ -41,48 +45,46 @@ def _build_static_actions(
         action_map = {signal_id: controller.act() for signal_id, controller in fixed_controllers.items()}
     elif policy_name == "STOCHASTIC":
         action_map = stochastic_actions(
-            signal_specs=env.get_resco_signal_specs(),
+            signal_specs=signal_specs,
             rng=stochastic_rng,
         )
     elif policy_name == "MAXWAVE":
         action_map = maxwave_actions(
-            signal_specs=env.get_resco_signal_specs(),
-            wave_states=env.get_resco_states("wave"),
+            signal_specs=signal_specs,
+            wave_states=adapter.as_state_dict(
+                observations,
+                feature_mode="wave",
+            ),
         )
     elif policy_name == "MAXPRESSURE":
         action_map = maxpressure_actions(
-            signal_specs=env.get_resco_signal_specs(),
-            mplight_states=env.get_resco_states("mplight"),
+            signal_specs=signal_specs,
+            mplight_states=adapter.as_state_dict(
+                observations,
+                feature_mode="mplight",
+            ),
         )
     else:
         raise ValueError(f"Unsupported static RESCO policy {policy_name!r}.")
-    return torch.tensor([int(action_map[tl_id]) for tl_id in env.tl_ids], dtype=torch.long)
+    return torch.tensor([int(action_map[tl_id]) for tl_id in tl_ids], dtype=torch.long)
 
 
 def _default_env_overrides_for_policy(policy_name: str) -> dict[str, Any]:
     defaults: dict[str, dict[str, Any]] = {
         "FIXED": {
-            "observation_mode": "wave",
-            "reward_mode": "wait",
             "step_length": 5,
         },
         "STOCHASTIC": {
-            "observation_mode": "mplight",
-            "reward_mode": "wait",
             "step_length": 5,
-            "benchmark_max_distance": 200,
+            "max_distance": 200,
         },
         "MAXWAVE": {
-            "observation_mode": "wave",
-            "reward_mode": "wait",
             "step_length": 10,
-            "benchmark_max_distance": 50,
+            "max_distance": 50,
         },
         "MAXPRESSURE": {
-            "observation_mode": "mplight",
-            "reward_mode": "wait",
             "step_length": 10,
-            "benchmark_max_distance": 9999,
+            "max_distance": 9999,
         },
     }
     if policy_name not in defaults:
@@ -104,12 +106,9 @@ def run_baseline(
 
     resolved_policy_name = str(policy_name).upper()
     resolved_env_cfg = dict(env_cfg)
-    resolved_env_cfg.setdefault("benchmark_mode", "resco")
     for key, value in _default_env_overrides_for_policy(resolved_policy_name).items():
         resolved_env_cfg.setdefault(key, value)
-    resolved_env_cfg.setdefault("benchmark_output_dir", str(output_dir))
-    if str(resolved_env_cfg.get("benchmark_mode", "native")) != "resco":
-        raise ValueError("Static baseline runner requires benchmark_mode='resco'.")
+    resolved_env_cfg.setdefault("output_dir", str(output_dir))
     try:
         get_resco_map_metadata(net_file=str(resolved_env_cfg["net_file"]))
     except KeyError as exc:
@@ -120,8 +119,14 @@ def run_baseline(
         ) from exc
 
     env = TrafficSignalEnv(**resolved_env_cfg)
-    env.reset()
-    signal_specs = env.get_resco_signal_specs()
+    td = env.reset()
+    signal_specs = env.get_signal_specs()
+    adapter = ObservationAdapter(
+        signal_specs=signal_specs,
+        tl_ids=env.tl_ids,
+        layout=env.observation_layout,
+        graph_metadata=env.get_graph_metadata(),
+    )
     stochastic_rng = random.Random(int(seed))
     fixed_controllers = {
         signal_id: RescoFixedSignalController(
@@ -138,7 +143,10 @@ def run_baseline(
     while True:
         actions = _build_static_actions(
             policy_name=resolved_policy_name,
-            env=env,
+            signal_specs=signal_specs,
+            observations=td["agents", "observation"],
+            adapter=adapter,
+            tl_ids=env.tl_ids,
             fixed_controllers=fixed_controllers,
             stochastic_rng=stochastic_rng,
         )
@@ -148,7 +156,7 @@ def run_baseline(
             break
 
     elapsed = time.perf_counter() - t0
-    raw_metrics = dict(env.get_episode_kpis())
+    raw_metrics = dict(env.get_episode_metrics())
     public_metrics = to_public_metrics(raw_metrics)
     env.close()
 
@@ -202,7 +210,7 @@ def run_baseline(
                 best_global_reward=float(public_metrics["Global Reward"]),
             )
         )
-        artifact_paths = env.get_benchmark_artifact_paths()
+        artifact_paths = env.get_artifact_paths()
         for artifact_path in artifact_paths.values():
             artifact = Path(artifact_path)
             if artifact.exists():

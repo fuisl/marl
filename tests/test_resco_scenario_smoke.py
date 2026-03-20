@@ -38,17 +38,14 @@ def test_resco_scenarios_reset_successfully(
         route_file=str(REPO_ROOT / route_rel),
         begin_time=begin_time,
         end_time=begin_time + 60,
-        benchmark_mode="resco",
-        observation_mode="wave",
-        reward_mode="wait",
         step_length=5,
-        benchmark_output_dir=str(tmp_path / scenario_name),
+        output_dir=str(tmp_path / scenario_name),
     )
     try:
         td = env.reset()
         assert env.n_agents > 0
         assert td["agents", "observation"].shape[0] == env.n_agents
-        specs = env.get_resco_signal_specs()
+        specs = env.get_signal_specs()
         assert set(specs) == set(env.tl_ids)
         for signal_id, spec in specs.items():
             assert int(spec["local_num_actions"]) > 0

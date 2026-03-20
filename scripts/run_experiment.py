@@ -49,6 +49,10 @@ def _handle_signal(signum: int, _frame: Any) -> None:
 
 
 def _as_plain(cfg: Any) -> Any:
+    if isinstance(cfg, dict):
+        return dict(cfg)
+    if cfg is None:
+        return None
     return OmegaConf.to_container(cfg, resolve=True)
 
 
