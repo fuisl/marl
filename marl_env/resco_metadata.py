@@ -227,12 +227,29 @@ def get_resco_map_metadata(*, map_name: str | None = None, net_file: str | None 
     resolved = map_name or (None if net_file is None else _normalize_map_name_from_net(net_file))
     if resolved is None:
         raise ValueError("Pass either map_name or net_file to resolve RESCO metadata.")
-    if resolved not in data:
-        supported = ", ".join(sorted(data))
-        raise KeyError(
-            f"Unsupported RESCO benchmark map {resolved!r}. Supported local metadata: {supported}."
-        )
-    metadata = data[resolved]
-    if not isinstance(metadata, dict):
-        raise TypeError(f"Vendored metadata for map {resolved!r} is malformed.")
-    return metadata
+    
+    # Try vendored metadata first
+    if resolved in data:
+        metadata = data[resolved]
+        if not isinstance(metadata, dict):
+            raise TypeError(f"Vendored metadata for map {resolved!r} is malformed.")
+        return metadata
+    
+    # Fallback: try runtime inference for grid5x5
+    if resolved == "grid5x5" and net_file is not None:
+        try:
+            from marl_env.grid_metadata import infer_grid_metadata_from_net
+            inferred = infer_grid_metadata_from_net(net_file)
+            # Normalize and validate the inferred metadata
+            normalized = _normalize_map_metadata(resolved, inferred)
+            return normalized
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to infer metadata for grid5x5 from {net_file}: {e}"
+            ) from e
+    
+    supported = ", ".join(sorted(data))
+    raise KeyError(
+        f"Unsupported RESCO benchmark map {resolved!r}. Supported vendored metadata: {supported}. "
+        f"(grid5x5 requires net_file for runtime inference.)"
+    )

@@ -1,0 +1,40 @@
+# Local-Neighbor GAT architecture configuration (Graph-enhanced with local encoders)
+# Graph builder mode: use walk_to_light for local neighborhood aggregation
+
+observation_adapter:
+  feature_mode: snapshot
+
+# Architecture selection
+architecture: local_neighbor_gat_discrete_sac
+
+# Local encoder: learn a latent representation from local observation
+local_encoder_cfg:
+  hidden_dim: 64
+  out_dim: 48
+
+# Neighbor encoder: GATv2 over graph structure
+neighbor_encoder_cfg:
+  hidden_dim: 64
+  out_dim: 48
+  heads: 2
+  edge_dim: 2
+  dropout: 0.1
+
+# Fusion MLP: combine local and neighbor representations
+fusion_cfg:
+  hidden_dim: 96
+  out_dim: 64
+
+# Actor head (shared discrete policy)
+actor_cfg:
+  hidden_dim: 96
+
+# Critic (centralized twin Q-networks)
+critic_cfg:
+  hidden_dim: 192
+
+# Entropy temperature
+init_alpha: 0.2
+
+# Target network soft-update coefficient
+tau: 0.005

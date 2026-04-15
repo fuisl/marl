@@ -342,3 +342,31 @@ def test_all_intersections_mode_includes_unsignalized_nodes_and_agent_mapping(
             dtype=torch.float32,
         ),
     )
+
+
+def test_grid5x5_topology_all_intersections_mode() -> None:
+    """Test Grid5x5 topology with all_intersections mode."""
+    from pathlib import Path
+    
+    net_file = "nets/grid5x5/grid5x5.net.xml"
+    if not Path(net_file).exists():
+        import pytest
+        pytest.skip(f"{net_file} not found")
+    
+    builder = GraphBuilder(net_file=net_file, tl_ids=None, mode="all_intersections")
+    edge_index, edge_attr = builder.build()
+    
+    # Grid5x5 should have approximately 25 nodes for the 5x5 intersection grid
+    assert 20 <= builder.num_nodes <= 30, f"Expected ~25 nodes, got {builder.num_nodes}"
+    
+    # Should have edges (at least ~80 for bundled grid5x5)
+    assert edge_index.shape[1] >= 50, f"Expected many edges, got {edge_index.shape[1]}"
+    
+    # Edge attributes should be [distance, n_lanes]
+    if edge_attr is not None:
+        assert edge_attr.shape[1] == 2, f"Expected 2 edge attributes, got {edge_attr.shape[1]}"
+        assert torch.isfinite(edge_attr).all()
+    
+    # Should have agent mapping
+    if builder.agent_node_indices is not None:
+        assert builder.agent_node_indices.shape[0] > 0

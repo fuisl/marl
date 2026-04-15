@@ -1,9 +1,10 @@
 defaults:
-  - override /algo: discrete_sac
+  - override /algo: sac
   - override /scenario: cologne8
+  - override /model: gat
   - override /train: default
   - _self_
 
-tags: [cologne8]
+tags: [cologne8, gat]
 runtime:
   out_dir: runs/cologne8_seed${seed}

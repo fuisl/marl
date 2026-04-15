@@ -57,7 +57,8 @@ def _validate_overrides(overrides: Sequence[str]) -> None:
                 f"'{token}'.\n"
                 "It looks like a full command was pasted into arguments.\n"
                 "Example correct usage:\n"
-                "  python scripts/run_sweep.py scenario=cologne1,cologne8 algo=discrete_sac"
+                "  python scripts/run_sweep.py scenario=cologne1,cologne8 "
+                "algo=sac model=gat"
             )
 
 

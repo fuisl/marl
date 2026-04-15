@@ -26,8 +26,8 @@ flowchart TB
   end
 
   subgraph ModelStack[Model Stack]
-    Agent[MARLDiscreteSAC]
-    Encoder[GraphEncoder\nGATv2]
+    Agent[LocalNeighborGATDiscreteSAC]
+    Encoder[NeighborEncoder\nGATv2]
     Actor[SharedDiscreteActor]
     Critic[CentralizedTwinCritic]
   end
@@ -76,20 +76,20 @@ flowchart TB
 ## 2. Baseline Architecture (Current)
 
 The current baseline uses `scripts/run_experiment.py` dispatching into
-`train/discrete_sac_loop.py` with graph encoder + Discrete SAC and optimizer
+`train/discrete_sac_loop.py` with local-neighbor GAT + Discrete SAC and optimizer
 selection through `rl/optimizers.py`.
 
 ```mermaid
 flowchart LR
-  Cfg[configs/run.yaml\n+ env/sumo + scenario/*\n+ model/default + train/default] --> Train[scripts/run_experiment.py]
+  Cfg[configs/run.yaml\n+ env/sumo + scenario/*\n+ model/local_neighbor_gat + train/default] --> Train[scripts/run_experiment.py]
   Train --> Loop[train/discrete_sac_loop.py]
   Loop --> Env[TrafficSignalEnv]
-  Loop --> Agent[MARLDiscreteSAC]
+  Loop --> Agent[LocalNeighborGATDiscreteSAC]
   Loop --> Loss[DiscreteSACLossComputer]
   Loop --> RB[ReplayBuffer\nFIFO ring buffer]
   Loop --> Opt[make_optimizer]
 
-  Agent --> Enc[GraphEncoder\n2x GATv2Conv]
+  Agent --> Enc[LocalEncoder + NeighborEncoder\nFusionMLP]
   Agent --> Act[SharedDiscreteActor]
   Agent --> Crit[CentralizedTwinCritic\n+ target critic]
 
@@ -107,7 +107,7 @@ flowchart LR
 sequenceDiagram
   participant T as train/discrete_sac_loop.py
   participant E as TrafficSignalEnv
-  participant A as MARLDiscreteSAC
+  participant A as LocalNeighborGATDiscreteSAC
   participant R as ReplayBuffer
   participant L as DiscreteSACLossComputer
   participant O as Optimizers (Adam/MetaAdam)

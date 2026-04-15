@@ -1,0 +1,8 @@
+defaults:
+  - override /algo: local_neighbor_gat_discrete_sac
+  - override /scenario: grid5x5
+  - override /model: local_neighbor_gat
+  - override /train: default
+  - _self_
+
+tags: [local_neighbor_gat, grid5x5, baseline]

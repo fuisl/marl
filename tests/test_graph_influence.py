@@ -12,7 +12,7 @@ from torch_geometric.utils import get_num_hops
 
 from config_utils import resolve_repo_path
 from models.graph_encoder import GraphEncoder
-from models.marl_discrete_sac import MARLDiscreteSAC
+from models.local_neighbor_gat_discrete_sac import LocalNeighborGATDiscreteSAC
 from visualization.graph_influence import (
     EncoderInfluenceModel,
     _total_influence_with_edge_attr,
@@ -135,7 +135,7 @@ def test_agent_pooling_averages_multiple_graph_nodes_per_rl_agent() -> None:
     agent_node_indices = torch.tensor([[0, 1], [2, -1]], dtype=torch.long)
     agent_node_mask = torch.tensor([[True, True], [True, False]])
 
-    pooled = MARLDiscreteSAC._pool_agent_latents(
+    pooled = LocalNeighborGATDiscreteSAC._pool_agent_latents(
         z_nodes,
         agent_node_indices=agent_node_indices,
         agent_node_mask=agent_node_mask,

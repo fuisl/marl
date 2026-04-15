@@ -24,7 +24,7 @@ from torch_geometric.utils.influence import k_hop_subsets_exact
 
 from marl_env.observation_adapter import GraphMetadata, ObservationAdapter
 from marl_env.sumo_env import TrafficSignalEnv
-from models.marl_discrete_sac import MARLDiscreteSAC
+from models.local_neighbor_gat_discrete_sac import LocalNeighborGATDiscreteSAC
 
 
 _PYG_RUNTIME_HINT = (
@@ -341,7 +341,7 @@ def _total_influence_with_edge_attr(
 @torch.no_grad()
 def count_episode_steps(
     env: TrafficSignalEnv,
-    agent: MARLDiscreteSAC,
+    agent: LocalNeighborGATDiscreteSAC,
     device: torch.device | str,
     adapter: ObservationAdapter,
     graph_metadata: GraphMetadata,
@@ -378,7 +378,7 @@ def count_episode_steps(
 @torch.no_grad()
 def collect_snapshot_graphs(
     env: TrafficSignalEnv,
-    agent: MARLDiscreteSAC,
+    agent: LocalNeighborGATDiscreteSAC,
     device: torch.device | str,
     snapshot_steps: list[int],
     adapter: ObservationAdapter,
@@ -443,13 +443,15 @@ def load_agent_for_visualization(
     graph_observation: Tensor,
     num_actions: int,
     device: torch.device,
-) -> MARLDiscreteSAC:
+) -> LocalNeighborGATDiscreteSAC:
     obs_dim = int(graph_observation.shape[-1])
 
-    agent = MARLDiscreteSAC(
+    agent = LocalNeighborGATDiscreteSAC(
         obs_dim=obs_dim,
         num_actions=num_actions,
-        encoder_cfg=dict(model_cfg.get("encoder_cfg", {})),
+        local_encoder_cfg=dict(model_cfg.get("local_encoder_cfg", {})),
+        neighbor_encoder_cfg=dict(model_cfg.get("neighbor_encoder_cfg", {})),
+        fusion_cfg=dict(model_cfg.get("fusion_cfg", {})),
         actor_cfg=dict(model_cfg.get("actor_cfg", {})),
         critic_cfg=dict(model_cfg.get("critic_cfg", {})),
         init_alpha=float(model_cfg.get("init_alpha", 0.2)),
@@ -1293,7 +1295,7 @@ def run_visualization(
             num_actions=env.num_actions,
             device=device_obj,
         )
-        influence_model = EncoderInfluenceModel(agent.encoder, edge_attr=edge_attr).to(device_obj)
+        influence_model = EncoderInfluenceModel(agent.neighbor_encoder, edge_attr=edge_attr).to(device_obj)
         influence_model.eval()
 
         resolved_max_hops = resolve_max_hops(influence_model, max_hops)

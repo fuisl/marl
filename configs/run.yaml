@@ -1,8 +1,8 @@
 defaults:
   - env: sumo
   - scenario: grid4x4
-  - algo: discrete_sac
-  - model: default
+  - algo: sac
+  - model: gat
   - train: default
   - logger: default
   - runtime: default

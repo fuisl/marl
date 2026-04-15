@@ -1,7 +1,8 @@
 defaults:
-  - override /algo: discrete_sac
+  - override /algo: sac
   - override /scenario: grid5x5
+  - override /model: gat
   - override /train: default
   - _self_
 
-tags: [baseline, grid5x5]
+tags: [baseline, gat, grid5x5]

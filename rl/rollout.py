@@ -12,7 +12,7 @@ from torch import Tensor
 
 from marl_env.observation_adapter import ObservationAdapter
 from marl_env.sumo_env import TrafficSignalEnv
-from models.marl_discrete_sac import MARLDiscreteSAC
+from models.local_neighbor_gat_discrete_sac import LocalNeighborGATDiscreteSAC
 
 
 class RolloutWorker:
@@ -22,7 +22,7 @@ class RolloutWorker:
     ----------
     env : TrafficSignalEnv
         The multi-agent SUMO environment.
-    agent : MARLDiscreteSAC
+    agent : LocalNeighborGATDiscreteSAC
         The MARL agent (encoder + actor + critics).
     device : torch.device
         Device for inference.
@@ -31,7 +31,7 @@ class RolloutWorker:
     def __init__(
         self,
         env: TrafficSignalEnv,
-        agent: MARLDiscreteSAC,
+        agent: LocalNeighborGATDiscreteSAC,
         device: torch.device | str = "cpu",
         *,
         feature_mode: str = "wave",

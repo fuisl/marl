@@ -13,7 +13,7 @@ import torch
 from tensordict import TensorDict
 from torch import Tensor
 
-from models.marl_discrete_sac import MARLDiscreteSAC
+from models.local_neighbor_gat_discrete_sac import LocalNeighborGATDiscreteSAC
 
 
 @dataclass
@@ -40,7 +40,7 @@ class DiscreteSACLossComputer:
 
     Parameters
     ----------
-    agent : MARLDiscreteSAC
+    agent : LocalNeighborGATDiscreteSAC
         The full MARL agent.
     gamma : float
         Discount factor.
@@ -48,7 +48,7 @@ class DiscreteSACLossComputer:
 
     def __init__(
         self,
-        agent: MARLDiscreteSAC,
+        agent: LocalNeighborGATDiscreteSAC,
         gamma: float = 0.99,
         *,
         use_huber_loss: bool = False,
@@ -284,13 +284,7 @@ class DiscreteSACLossComputer:
         agent_node_mask: Tensor | None,
         B: int,
     ) -> Tensor:
-        """Encode a batch of observations through the graph encoder.
-
-        Handles the fact that PyG GATv2Conv expects ``[N, D]`` by flattening
-        the batch and agent dims, running through a shared graph, then reshaping.
-
-        For now, assumes a **shared topology** across the batch (same edge_index).
-        """
+        """Encode a batch of observations via local+neighbor+fusion blocks."""
         num_graph_nodes = graph_obs.shape[1]
         obs_flat = graph_obs.reshape(B * num_graph_nodes, -1)  # [B*N_graph, obs_dim]
 
@@ -307,7 +301,9 @@ class DiscreteSACLossComputer:
             ea = edge_attr[0] if edge_attr.dim() == 3 else edge_attr
             ea_batch = ea.repeat(B, 1)
 
-        z_flat = self.agent.encoder(obs_flat, ei_batch, ea_batch)
+        z_local = self.agent.local_encoder(obs_flat)
+        z_neighbor = self.agent.neighbor_encoder(obs_flat, ei_batch, ea_batch)
+        z_flat = self.agent.fusion(z_local, z_neighbor)
         z_nodes = z_flat.reshape(B, num_graph_nodes, -1)
         return self.agent._pool_agent_latents(
             z_nodes,

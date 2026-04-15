@@ -441,7 +441,7 @@ Training and evaluation logs expose:
 
 ### Graph RL Path
 
-Current graph SAC uses this flow:
+Current local-neighbor graph SAC uses this flow:
 
 1. `env.reset()` returns canonical snapshot observations
 2. `ObservationAdapter.graph_features(..., feature_mode=<mode>)` converts them
@@ -451,15 +451,15 @@ Current graph SAC uses this flow:
    - `edge_attr`
    - `agent_node_indices`
    - `agent_node_mask`
-4. `MARLDiscreteSAC` encodes graph node features and pools them back to agents
+4. `LocalNeighborGATDiscreteSAC` encodes local and neighbor features, then pools node latents back to agents
 5. The actor outputs one local action index per signal
 
-Default adapter mode for graph SAC comes from
+Default adapter mode for the baseline comes from
 [default.yaml](/home/tuancuong/data5t/marl/configs/model/default.yaml#L5):
 
 ```yaml
 observation_adapter:
-  feature_mode: wave
+  feature_mode: snapshot
 ```
 
 ### Static RESCO Controllers

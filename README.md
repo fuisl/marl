@@ -35,7 +35,8 @@ Top-level composition is defined in `configs/run.yaml`.
 Default values come from `configs/run.yaml` + selected groups:
 
 - `scenario=grid4x4`
-- `algo=discrete_sac`
+- `algo=sac`
+- `model=gat`
 - `seed=21`
 - `project=marl-traffic-gat`
 - `run_name=${algo.name}_${scenario.name}_seed${seed}`
@@ -50,7 +51,7 @@ python scripts/run_experiment.py
 python scripts/run_experiment.py experiment=grid5x5
 
 # Train on a specific scenario
-python scripts/run_experiment.py scenario=cologne8 algo=discrete_sac
+python scripts/run_experiment.py scenario=cologne8 algo=sac model=gat
 
 # Run fixed-time baseline
 python scripts/run_experiment.py algo=fixed

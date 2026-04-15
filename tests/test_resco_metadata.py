@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from marl_env.resco_metadata import (
     SUPPORTED_RESCO_MAPS,
     get_resco_map_metadata,
@@ -43,3 +45,17 @@ def test_heterogeneous_maps_expose_contiguous_local_action_mappings() -> None:
             assert global_indices[0] >= 0
             assert global_indices[-1] < len(metadata["phase_pairs"])
             assert local_indices == list(range(len(local_indices)))
+
+
+def test_grid5x5_metadata_resolution_via_net_file() -> None:
+    """Test that Grid5x5 metadata can be resolved via net_file fallback."""
+    net_file = "nets/grid5x5/grid5x5.net.xml"
+    if not Path(net_file).exists():
+        import pytest
+        pytest.skip(f"{net_file} not found")
+    
+    # Should not raise KeyError; instead, infers from net file
+    metadata = get_resco_map_metadata(net_file=net_file)
+    assert isinstance(metadata, dict)
+    assert "phase_pairs" in metadata
+    assert "pair_to_act_map" in metadata

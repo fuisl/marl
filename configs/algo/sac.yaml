@@ -1,0 +1,7 @@
+name: sac
+trainer: discrete_sac
+kind: off_policy
+
+supports:
+  action_space: [discrete]
+  obs_space: [snapshot]

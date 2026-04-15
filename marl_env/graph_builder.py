@@ -58,8 +58,14 @@ class GraphBuilder:
 
         self.net: Any = sumolib.net.readNet(net_file, withInternal=False)
         self.mode = mode
-        self.tl_ids = tl_ids
-        self._id_to_idx = {tl_id: i for i, tl_id in enumerate(tl_ids)}
+        
+        # In all_intersections mode, infer tl_ids from the network if not provided
+        if mode == "all_intersections" and tl_ids is None:
+            self.tl_ids = [tl.getID() for tl in self.net.getTrafficLights()]
+        else:
+            self.tl_ids = tl_ids if tl_ids is not None else []
+        
+        self._id_to_idx = {tl_id: i for i, tl_id in enumerate(self.tl_ids)}
         self._tls_nodes_by_id = self._build_tls_node_map()
         self._node_to_tls_id = self._build_node_to_tls_map(self._tls_nodes_by_id)
         self._graph_node_ids = self._build_graph_node_ids()

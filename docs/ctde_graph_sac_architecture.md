@@ -6,10 +6,9 @@ It is based on the code paths that are actually used today:
 
 - `marl_env/sumo_env.py`
 - `marl_env/graph_builder.py`
-- `models/graph_encoder.py`
 - `models/actor.py`
 - `models/critic.py`
-- `models/marl_discrete_sac.py`
+- `models/local_neighbor_gat_discrete_sac.py`
 - `rl/losses.py`
 - `rl/rollout.py`
 - `train/discrete_sac_loop.py`
@@ -18,7 +17,7 @@ The shortest summary is:
 
 1. SUMO produces traffic-light agents and a static road graph.
 2. Every decision step, the environment builds node features.
-3. A GATv2 encoder turns those node features into latent embeddings.
+3. Local and neighbor encoders (with GATv2 for neighbors) turn node features into latent embeddings.
 4. A shared actor chooses one discrete green-phase action per RL-controlled light.
 5. A centralized twin critic evaluates those actions using both local agent latent and a pooled graph context.
 6. Training is done with Discrete SAC and replay.
@@ -228,7 +227,7 @@ $$
 z_m^{\text{agent}} = \frac{1}{|S_m|} \sum_{i \in S_m} z_i
 $$
 
-This is implemented in `MARLDiscreteSAC._pool_agent_latents(...)`.
+This is implemented in `LocalNeighborGATDiscreteSAC._pool_agent_latents(...)`.
 
 That mean-pooling step is the bridge that makes `all_intersections` trainable without changing the action space.
 

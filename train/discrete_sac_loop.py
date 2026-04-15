@@ -1,10 +1,9 @@
-"""Train a GAT-based MARL agent with a raw custom loop.
+"""Train the Local-Neighbor GAT Discrete SAC baseline with a raw loop.
 
 Wires together:
-  - ``TrafficSignalEnv`` over real SUMO (via libsumo, no GUI)
-  - ``GraphEncoder`` (2-layer GATv2Conv) — learns graph dynamics
-  - ``SharedDiscreteActor`` + ``CentralizedTwinCritic`` (Discrete SAC)
-  - Simple ring-buffer replay + manual SAC update loop
+    - ``TrafficSignalEnv`` over real SUMO (via libsumo, no GUI)
+    - ``LocalNeighborGATDiscreteSAC`` (local encoder + neighbor GAT + fusion)
+    - Discrete SAC losses, replay, and manual optimization steps
 
 Requirements
 ------------
@@ -41,7 +40,7 @@ from torch import Tensor
 
 from marl_env.observation_adapter import GraphMetadata, ObservationAdapter  # noqa: E402
 from marl_env.sumo_env import TrafficSignalEnv  # noqa: E402
-from models.marl_discrete_sac import MARLDiscreteSAC  # noqa: E402
+from models.local_neighbor_gat_discrete_sac import LocalNeighborGATDiscreteSAC  # noqa: E402
 from rl.losses import DiscreteSACLossComputer  # noqa: E402
 from rl.optimizers import make_optimizer  # noqa: E402
 from train.training_logging import (  # noqa: E402
@@ -52,6 +51,213 @@ from train.training_logging import (  # noqa: E402
 )
 from train.postprocess import postprocess_after_training  # noqa: E402
 from train.wandb_utils import SafeWandbRun  # noqa: E402
+
+
+def _build_environment(cfg: DictConfig, out_dir: Path) -> TrafficSignalEnv:
+    additional_files = maybe_to_container(cfg.env.additional_files)
+    return TrafficSignalEnv(
+        net_file=cfg.env.net_file,
+        route_file=cfg.env.route_file,
+        delta_t=int(cfg.env.delta_t),
+        step_length=int(cfg.env.step_length)
+        if getattr(cfg.env, "step_length", None) is not None
+        else None,
+        reward_name=cfg.env.reward_name,
+        yellow_duration=int(cfg.env.yellow_duration),
+        all_red_duration=int(cfg.env.all_red_duration),
+        min_green_duration=int(cfg.env.min_green_duration),
+        sumo_binary=cfg.env.sumo_binary,
+        gui=bool(cfg.env.gui),
+        begin_time=int(cfg.env.begin_time),
+        end_time=int(cfg.env.end_time),
+        additional_files=additional_files,
+        timeloss_subscription_policy=str(
+            getattr(cfg.env, "timeloss_subscription_policy", "strict")
+        ),
+        max_distance=int(getattr(cfg.env, "max_distance", 200)),
+        output_dir=str(out_dir),
+    )
+
+
+def _build_observation_pipeline(
+    env: TrafficSignalEnv,
+    cfg: DictConfig,
+    device: torch.device,
+) -> tuple[ObservationAdapter, str, GraphMetadata, int]:
+    td0 = env.reset()
+    graph_metadata = env.get_graph_metadata()
+
+    observation_adapter_cfg = maybe_to_container(
+        cfg.model.get("observation_adapter", {})
+    ) or {}
+    feature_mode = str(observation_adapter_cfg.get("feature_mode", "snapshot"))
+
+    adapter = ObservationAdapter(
+        signal_specs=env.get_signal_specs(),
+        tl_ids=env.tl_ids,
+        layout=env.observation_layout,
+        graph_metadata=graph_metadata,
+    )
+
+    obs_dim = int(
+        adapter.graph_features(
+            td0["agents", "observation"].to(device),
+            feature_mode=feature_mode,
+        ).shape[-1]
+    )
+    return adapter, feature_mode, graph_metadata, obs_dim
+
+
+def _build_agent(
+    cfg: DictConfig,
+    *,
+    obs_dim: int,
+    num_actions: int,
+    device: torch.device,
+) -> LocalNeighborGATDiscreteSAC:
+    local_encoder_cfg = maybe_to_container(cfg.model.get("local_encoder_cfg", {}))
+    neighbor_encoder_cfg = maybe_to_container(
+        cfg.model.get("neighbor_encoder_cfg", {})
+    )
+    fusion_cfg = maybe_to_container(cfg.model.get("fusion_cfg", {}))
+    actor_cfg = maybe_to_container(cfg.model.actor_cfg)
+    critic_cfg = maybe_to_container(cfg.model.critic_cfg)
+
+    return LocalNeighborGATDiscreteSAC(
+        obs_dim=obs_dim,
+        num_actions=num_actions,
+        local_encoder_cfg=local_encoder_cfg,
+        neighbor_encoder_cfg=neighbor_encoder_cfg,
+        fusion_cfg=fusion_cfg,
+        actor_cfg=actor_cfg,
+        critic_cfg=critic_cfg,
+        init_alpha=float(cfg.model.init_alpha),
+        tau=float(cfg.model.tau),
+    ).to(device)
+
+
+def _build_optimizers(
+    cfg: DictConfig,
+    agent: LocalNeighborGATDiscreteSAC,
+) -> tuple[Mapping[str, torch.optim.Optimizer], str, str]:
+    base_optimizer_name = str(cfg.train.optimizer.name)
+    optim_actor_cfg = maybe_to_container(
+        cfg.train.get("optimizer_actor", cfg.train.optimizer)
+    )
+    optim_critic_cfg = maybe_to_container(
+        cfg.train.get("optimizer_critic", cfg.train.optimizer)
+    )
+    optim_alpha_cfg = maybe_to_container(
+        cfg.train.get("optimizer_alpha", cfg.train.optimizer)
+    )
+
+    encoder_actor_params = (
+        list(agent.local_encoder.parameters())
+        + list(agent.neighbor_encoder.parameters())
+        + list(agent.fusion.parameters())
+        + list(agent.actor.parameters())
+    )
+
+    optimizers = {
+        "actor": make_optimizer(encoder_actor_params, optim_actor_cfg),
+        "critic": make_optimizer(agent.critic.parameters(), optim_critic_cfg),
+        "alpha": make_optimizer([agent.log_alpha], optim_alpha_cfg),
+    }
+
+    actor_opt_name = str(optim_actor_cfg.get("name", base_optimizer_name))
+    critic_opt_name = str(optim_critic_cfg.get("name", base_optimizer_name))
+    return optimizers, actor_opt_name, critic_opt_name
+
+
+def _build_loss_and_replay(
+    cfg: DictConfig,
+    *,
+    agent: LocalNeighborGATDiscreteSAC,
+    seed: int,
+) -> tuple[DiscreteSACLossComputer, ReplayBuffer]:
+    critic_stability_cfg = maybe_to_container(cfg.train.get("critic_stability", {})) or {}
+    loss_fn = DiscreteSACLossComputer(
+        agent,
+        gamma=float(cfg.train.gamma),
+        use_huber_loss=bool(critic_stability_cfg.get("use_huber_loss", False)),
+        huber_delta=float(critic_stability_cfg.get("huber_delta", 1.0)),
+        clip_target_q=bool(critic_stability_cfg.get("clip_target_q", False)),
+        target_q_min=float(critic_stability_cfg.get("target_q_min", -1000.0)),
+        target_q_max=float(critic_stability_cfg.get("target_q_max", 1000.0)),
+    )
+    replay = ReplayBuffer(int(cfg.train.replay_capacity), seed=seed)
+    return loss_fn, replay
+
+
+def _init_wandb(
+    cfg: DictConfig,
+    *,
+    enabled: bool,
+    out_dir: Path,
+    device: torch.device,
+    n_agents: int,
+    obs_dim: int,
+    num_actions: int,
+    n_edges: int,
+    actor_opt_name: str,
+    critic_opt_name: str,
+    reward_name: str,
+    feature_mode: str,
+    seed: int,
+) -> SafeWandbRun:
+    wandb_run = SafeWandbRun(enabled=enabled)
+    if not wandb_run.enabled:
+        return wandb_run
+
+    run_name = cfg.wandb.run_name
+    if not run_name:
+        run_name = (
+            f"gat_a{actor_opt_name}_c{critic_opt_name}_{reward_name}_seed{seed}"
+        )
+
+    wandb_cfg_raw = OmegaConf.to_container(cfg, resolve=True)
+    wandb_cfg: dict[str, Any] | None = None
+    if isinstance(wandb_cfg_raw, dict):
+        wandb_cfg = {str(k): v for k, v in wandb_cfg_raw.items()}
+
+    run_metadata: dict[str, Any] = {
+        "device": str(device),
+        "n_agents": n_agents,
+        "obs_dim": obs_dim,
+        "num_actions": num_actions,
+        "graph_edges": n_edges,
+        "run_name": str(run_name),
+        "optimizer_actor": actor_opt_name,
+        "optimizer_critic": critic_opt_name,
+        "reward_name": reward_name,
+        "feature_mode": feature_mode,
+    }
+    wandb_run.init_training_run(
+        project=str(cfg.wandb.project),
+        run_name=str(run_name),
+        run_config=wandb_cfg,
+        out_dir=out_dir,
+        tags=[
+            "gat",
+            "discrete-sac",
+            "resco",
+            actor_opt_name,
+            critic_opt_name,
+            reward_name,
+            feature_mode,
+        ],
+        run_metadata=run_metadata,
+    )
+    return wandb_run
+
+
+def _open_train_log(out_dir: Path) -> tuple[Path, Any, csv.DictWriter]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "train_log.csv"
+    log_file = log_path.open("w", newline="")
+    writer = csv.DictWriter(log_file, fieldnames=TRAIN_LOG_FIELDNAMES)
+    writer.writeheader()
+    return log_path, log_file, writer
 
 
 # ======================================================================
@@ -109,7 +315,7 @@ def pack_transition(
         ├── edge_index        [2, E]
         └── edge_attr         [E, 2]   (if present)
     """
-    n = td["agents"].batch_size[0]
+    n = int(td["agents", "observation"].shape[0])
     t = TensorDict(
         {
             "agents": TensorDict(
@@ -215,7 +421,7 @@ def collate_batch(transitions: list[TensorDict]) -> TensorDict:
 @torch.no_grad()
 def run_episode(
     env: TrafficSignalEnv,
-    agent: MARLDiscreteSAC,
+    agent: LocalNeighborGATDiscreteSAC,
     device: torch.device,
     adapter: ObservationAdapter,
     feature_mode: str,
@@ -318,7 +524,9 @@ def sac_update(
     optimizers["actor"].zero_grad()
     out.actor_loss.backward()
     torch.nn.utils.clip_grad_norm_(
-        list(loss_fn.agent.encoder.parameters())
+        list(loss_fn.agent.local_encoder.parameters())
+        + list(loss_fn.agent.neighbor_encoder.parameters())
+        + list(loss_fn.agent.fusion.parameters())
         + list(loss_fn.agent.actor.parameters()),
         max_norm=10.0,
     )
@@ -349,9 +557,8 @@ def sac_update(
 def train(cfg: DictConfig) -> dict[str, Any]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = int(cfg.train.seed)
-    base_optimizer_name = str(cfg.train.optimizer.name)
     reward_name = str(cfg.env.reward_name)
-    print(f"[train_gat_baseline] device={device}")
+    print(f"[train_local_neighbor_gat_sac] device={device}")
     print(f"  net:   {cfg.env.net_file}")
     print(f"  route: {cfg.env.route_file}")
 
@@ -359,141 +566,56 @@ def train(cfg: DictConfig) -> dict[str, Any]:
     random.seed(seed)
 
     out_dir = resolve_repo_path(cfg.runtime.out_dir)
-    additional_files = maybe_to_container(cfg.env.additional_files)
+    env = _build_environment(cfg, out_dir)
 
-    # --- Environment (real SUMO via libsumo) ---
-    env = TrafficSignalEnv(
-        net_file=cfg.env.net_file,
-        route_file=cfg.env.route_file,
-        delta_t=int(cfg.env.delta_t),
-        step_length=int(cfg.env.step_length) if getattr(cfg.env, "step_length", None) is not None else None,
-        reward_name=cfg.env.reward_name,
-        yellow_duration=int(cfg.env.yellow_duration),
-        all_red_duration=int(cfg.env.all_red_duration),
-        min_green_duration=int(cfg.env.min_green_duration),
-        sumo_binary=cfg.env.sumo_binary,
-        gui=bool(cfg.env.gui),
-        begin_time=int(cfg.env.begin_time),
-        end_time=int(cfg.env.end_time),
-        additional_files=additional_files,
-        timeloss_subscription_policy=str(getattr(cfg.env, "timeloss_subscription_policy", "strict")),
-        max_distance=int(getattr(cfg.env, "max_distance", 200)),
-        output_dir=str(out_dir),
-    )
-
-    td0 = env.reset()
-    observation_adapter_cfg = maybe_to_container(cfg.model.get("observation_adapter", {})) or {}
-    feature_mode = str(observation_adapter_cfg.get("feature_mode", "wave"))
-    graph_metadata = env.get_graph_metadata()
-    adapter = ObservationAdapter(
-        signal_specs=env.get_signal_specs(),
-        tl_ids=env.tl_ids,
-        layout=env.observation_layout,
-        graph_metadata=graph_metadata,
-    )
-    obs_dim = int(
-        adapter.graph_features(
-            td0["agents", "observation"],
-            feature_mode=feature_mode,
-        ).shape[-1]
+    adapter, feature_mode, graph_metadata, obs_dim = _build_observation_pipeline(
+        env,
+        cfg,
+        device,
     )
     num_actions = env.num_actions
-    n_agents    = env.n_agents
-    n_edges     = int(graph_metadata.edge_index.shape[1])
+    n_agents = env.n_agents
+    n_edges = int(graph_metadata.edge_index.shape[1])
     print(
         f"  agents={n_agents}  obs_dim={obs_dim}"
         f"  num_actions={num_actions}  graph_edges={n_edges}"
     )
 
-    # --- Agent ---
-    encoder_cfg = maybe_to_container(cfg.model.encoder_cfg)
-    actor_cfg = maybe_to_container(cfg.model.actor_cfg)
-    critic_cfg = maybe_to_container(cfg.model.critic_cfg)
-
-    agent = MARLDiscreteSAC(
+    agent = _build_agent(
+        cfg,
         obs_dim=obs_dim,
         num_actions=num_actions,
-        encoder_cfg=encoder_cfg,
-        actor_cfg=actor_cfg,
-        critic_cfg=critic_cfg,
-        init_alpha=float(cfg.model.init_alpha),
-        tau=float(cfg.model.tau),
-    ).to(device)
+        device=device,
+    )
 
     total_params = sum(p.numel() for p in agent.parameters())
     print(f"  agent params: {total_params:,}")
+    print("  architecture: local_neighbor_gat_discrete_sac")
 
-    # --- Optimizers ---
-    optim_actor_cfg = maybe_to_container(cfg.train.get("optimizer_actor", cfg.train.optimizer))
-    optim_critic_cfg = maybe_to_container(cfg.train.get("optimizer_critic", cfg.train.optimizer))
-    optim_alpha_cfg = maybe_to_container(cfg.train.get("optimizer_alpha", cfg.train.optimizer))
-    opt_enc_actor = make_optimizer(
-        list(agent.encoder.parameters()) + list(agent.actor.parameters()),
-        optim_actor_cfg,
+    optimizers, actor_opt_name, critic_opt_name = _build_optimizers(cfg, agent)
+    loss_fn, replay = _build_loss_and_replay(cfg, agent=agent, seed=seed)
+
+    wandb_run = _init_wandb(
+        cfg,
+        enabled=bool(cfg.wandb.enabled),
+        out_dir=out_dir,
+        device=device,
+        n_agents=n_agents,
+        obs_dim=obs_dim,
+        num_actions=num_actions,
+        n_edges=n_edges,
+        actor_opt_name=actor_opt_name,
+        critic_opt_name=critic_opt_name,
+        reward_name=reward_name,
+        feature_mode=feature_mode,
+        seed=seed,
     )
-    opt_critic = make_optimizer(agent.critic.parameters(), optim_critic_cfg)
-    opt_alpha  = make_optimizer([agent.log_alpha], optim_alpha_cfg)
-    optimizers = {"actor": opt_enc_actor, "critic": opt_critic, "alpha": opt_alpha}
 
-    actor_opt_name = str(optim_actor_cfg.get("name", base_optimizer_name))
-    critic_opt_name = str(optim_critic_cfg.get("name", base_optimizer_name))
-
-    # --- Loss & Replay ---
-    critic_stability_cfg = maybe_to_container(cfg.train.get("critic_stability", {})) or {}
-    loss_fn = DiscreteSACLossComputer(
-        agent,
-        gamma=float(cfg.train.gamma),
-        use_huber_loss=bool(critic_stability_cfg.get("use_huber_loss", False)),
-        huber_delta=float(critic_stability_cfg.get("huber_delta", 1.0)),
-        clip_target_q=bool(critic_stability_cfg.get("clip_target_q", False)),
-        target_q_min=float(critic_stability_cfg.get("target_q_min", -1000.0)),
-        target_q_max=float(critic_stability_cfg.get("target_q_max", 1000.0)),
-    )
-    replay  = ReplayBuffer(int(cfg.train.replay_capacity), seed=seed)
-
-    # --- W&B ---
-    wandb_run = SafeWandbRun(enabled=bool(cfg.wandb.enabled))
-    if wandb_run.enabled:
-        run_name = cfg.wandb.run_name
-        if not run_name:
-            run_name = f"gat_a{actor_opt_name}_c{critic_opt_name}_{reward_name}_seed{seed}"
-        wandb_cfg_raw = OmegaConf.to_container(cfg, resolve=True)
-        wandb_cfg: dict[str, Any] | None = None
-        if isinstance(wandb_cfg_raw, dict):
-            wandb_cfg = {str(k): v for k, v in wandb_cfg_raw.items()}
-        run_metadata: dict[str, Any] = {
-            "device": str(device),
-            "n_agents": n_agents,
-            "obs_dim": obs_dim,
-            "num_actions": num_actions,
-            "graph_edges": n_edges,
-            "run_name": str(run_name),
-            "optimizer_actor": actor_opt_name,
-            "optimizer_critic": critic_opt_name,
-            "reward_name": reward_name,
-            "feature_mode": feature_mode,
-        }
-        wandb_run.init_training_run(
-            project=str(cfg.wandb.project),
-            run_name=str(run_name),
-            run_config=wandb_cfg,
-            out_dir=out_dir,
-            tags=["gat", "discrete-sac", "resco", actor_opt_name, critic_opt_name, reward_name, feature_mode],
-            run_metadata=run_metadata,
-        )
-
-    # --- Logging ---
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / "train_log.csv"
-    fieldnames = TRAIN_LOG_FIELDNAMES
-    log_f  = log_path.open("w", newline="")
-    writer = csv.DictWriter(log_f, fieldnames=fieldnames)
-    writer.writeheader()
+    log_path, log_f, writer = _open_train_log(out_dir)
 
     # --- Training ---
     best_global_reward = float("-inf")
     total_transitions = 0
-    last_metrics: dict[str, Any] = {}
     t0 = time.perf_counter()
     interrupted = False
     episodes_completed = 0
@@ -525,8 +647,8 @@ def train(cfg: DictConfig) -> dict[str, Any]:
             if total_transitions >= int(cfg.train.warmup):
                 for _ in range(len(transitions) * int(cfg.train.updates_per_step)):
                     m = sac_update(loss_fn, replay, optimizers, int(cfg.train.batch_size), device)
-                    if m is not None:
-                        last_metrics = m
+                    if m is None:
+                        break
 
             # --- Checkpoint ---
             if ep_return > best_global_reward:

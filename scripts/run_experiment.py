@@ -7,8 +7,8 @@ using Hydra, validates compatibility, and dispatches to the selected trainer.
 Usage:
     python scripts/run_experiment.py
     python scripts/run_experiment.py experiment=grid5x5
-    python scripts/run_experiment.py scenario=cologne8 algo=discrete_sac
-    python scripts/run_experiment.py -m scenario=grid5x5,cologne1 algo=discrete_sac seed=1,2
+    python scripts/run_experiment.py scenario=cologne8 algo=sac model=gat
+    python scripts/run_experiment.py -m scenario=grid5x5,cologne1 algo=sac model=gat seed=1,2
 """
 
 from __future__ import annotations

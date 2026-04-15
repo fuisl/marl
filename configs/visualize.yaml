@@ -1,7 +1,7 @@
 defaults:
   - env: sumo
   - scenario: grid5x5
-  - model: default
+  - model: gat
   - _self_
 
 runtime:

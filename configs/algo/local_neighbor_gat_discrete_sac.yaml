@@ -1,4 +1,4 @@
-name: discrete_sac
+name: local_neighbor_gat_discrete_sac
 trainer: discrete_sac
 kind: off_policy
 

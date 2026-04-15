@@ -1,0 +1,5 @@
+# Simple alias for the current Local-Neighbor GAT architecture.
+
+defaults:
+  - local_neighbor_gat
+  - _self_

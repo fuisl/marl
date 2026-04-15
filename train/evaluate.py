@@ -15,7 +15,7 @@ from config_utils import load_dotenv, resolve_repo_path
 from marl_env.observation_adapter import ObservationAdapter
 from marl_env.resco_reporting import to_public_metrics
 from marl_env.sumo_env import TrafficSignalEnv
-from models.marl_discrete_sac import MARLDiscreteSAC
+from models.local_neighbor_gat_discrete_sac import LocalNeighborGATDiscreteSAC
 
 load_dotenv()
 
@@ -61,11 +61,18 @@ def evaluate(
     )
     num_actions = int(env.num_actions)
 
-    agent = MARLDiscreteSAC(
+    agent = LocalNeighborGATDiscreteSAC(
         obs_dim=obs_dim,
         num_actions=num_actions,
-        **model_cfg,
+        local_encoder_cfg=model_cfg.get("local_encoder_cfg"),
+        neighbor_encoder_cfg=model_cfg.get("neighbor_encoder_cfg"),
+        fusion_cfg=model_cfg.get("fusion_cfg"),
+        actor_cfg=model_cfg.get("actor_cfg"),
+        critic_cfg=model_cfg.get("critic_cfg"),
+        init_alpha=float(model_cfg.get("init_alpha", 0.2)),
+        tau=float(model_cfg.get("tau", 0.005)),
     ).to(device)
+    
     state_dict = torch.load(checkpoint_path, map_location=device)
     agent.load_state_dict(state_dict)
     agent.eval()
